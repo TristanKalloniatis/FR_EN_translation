@@ -1,6 +1,7 @@
 # Custom file types for this project
 *.txt
 .data/
+data.zip
 .idea/
 *.pkl
 *.png
