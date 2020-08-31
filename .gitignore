@@ -1,3 +1,16 @@
+# Custom file types for this project
+*.txt
+.data/
+.idea/
+*.pkl
+*.png
+*.ipynb
+embeds*.csv
+trained_embeddings/
+learning_curves/
+log_files/
+saved_models/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
