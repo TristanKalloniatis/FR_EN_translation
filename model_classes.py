@@ -4,7 +4,7 @@ import os
 from abc import ABC
 import matplotlib.pyplot as plt
 import datetime
-from math import nan
+from math import nan, log
 
 
 if not os.path.exists('learning_curves/'):
@@ -214,6 +214,68 @@ class EncoderDecoderGRU(BaseModelClass):
     def forward(self, inputs, outputs):
         encoder_output, encoder_hn = self.encoder(inputs)
         return self.decoder(outputs, encoder_output, encoder_hn)
+
+
+class PositionalEncoding(torch.nn.Module):
+    # Modified from https://github.com/pytorch/examples/blob/master/word_language_model/model.py
+    def __init__(self, d_model, dropout=0.1, max_len=1000):
+        assert d_model % 2 == 0
+        super().__init__()
+        self.dropout = torch.nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # [T, B, d_model] -> [T, B, d_model]
+        x = x + self.pe[:x.size(0), :]
+        return self.dropout(x)
+
+
+class Transformer(BaseModelClass, ABC):
+    def __init__(self, input_lang, output_lang, num_layers=1, max_len=500,
+                 embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION,
+                 nhead=data_hyperparameters.ATTENTION_HEADS, dim_feedforward=data_hyperparameters.FEEDFORWARD_DIMENSION,
+                 dropout=data_hyperparameters.DROPOUT,
+                 positional_encoding_dropout=data_hyperparameters.POSITIONAL_ENCODER_DROPOUT,
+                 name='TransformerEncoder'):
+        super().__init__()
+        assert embedding_dimension % nhead == 0
+        self.max_len = max_len
+        self.name = name
+        self.input_language_name = input_lang.name
+        self.output_lang_name = output_lang.name
+        self.embedding_dimension = embedding_dimension
+        self.input_embedding = torch.nn.Embedding(input_lang.n_words, embedding_dimension,
+                                                  padding_idx=data_hyperparameters.PAD_TOKEN)
+        self.output_embedding = torch.nn.Embedding(output_lang.n_words, embedding_dimension,
+                                                   padding_idx=data_hyperparameters.PAD_TOKEN)
+        self.input_positional_encoder = PositionalEncoding(embedding_dimension, max_len=max_len,
+                                                           dropout=positional_encoding_dropout)
+        self.output_positional_encoder = PositionalEncoding(embedding_dimension, max_len=max_len,
+                                                            dropout=positional_encoding_dropout)
+        self.transformer = torch.nn.Transformer(embedding_dimension, nhead, num_layers, num_layers, dim_feedforward, dropout)
+        self.linear = torch.nn.Linear(embedding_dimension, output_lang.n_words)
+        self.finish_setup()
+
+    def forward(self, inputs, outputs):
+        input_truncated = inputs[:, :self.max_len]
+        output_truncated = outputs[:, :self.max_len]
+        input_embeds = self.input_embedding(input_truncated).transpose(0, 1)
+        output_embeds = self.output_embedding(output_truncated).transpose(0, 1)
+        input_positional_encodings = self.input_positional_encoder(input_embeds)
+        output_positional_encodings = self.output_positional_encoder(output_embeds)
+        src_key_padding_mask = (input_truncated == data_hyperparameters.PAD_TOKEN)
+        tgt_key_padding_mask = (output_truncated == data_hyperparameters.PAD_TOKEN)
+        transforms = self.transformer(input_positional_encodings, output_positional_encodings,
+                                      src_key_padding_mask=src_key_padding_mask,
+                                      tgt_key_padding_mask=tgt_key_padding_mask)
+        out = self.linear(transforms.transpose(0, 1))
+        return torch.nn.functional.log_softmax(out, dim=-1)
 
 
 class PackedLoss(torch.nn.Module):
