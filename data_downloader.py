@@ -150,4 +150,4 @@ def get_dataloader(input_dataset, output_dataset, batch_size=data_hyperparameter
         return xs_padded, ys_padded
 
     return torch.utils.data.DataLoader(dataset=augment_dataset(input_dataset, output_dataset),
-                                       batch_size=batch_size, collate_fn=pad_batch)
+                                       batch_size=batch_size, collate_fn=pad_batch, pin_memory=True)

@@ -4,7 +4,7 @@ from datetime import datetime
 import os
 import csv
 from log_utils import create_logger, write_log
-from model_classes import get_accuracy
+from model_classes import get_accuracy, PackedLoss
 from pickle import dump, load
 
 LOG_FILE = 'model_pipeline'
@@ -16,11 +16,10 @@ if not os.path.exists('saved_models/'):
 
 def train(model, train_data, valid_data, epochs=data_hyperparameters.EPOCHS, patience=data_hyperparameters.PATIENCE,
           report_accuracy_every=data_hyperparameters.REPORT_ACCURACY_EVERY):
-    loss_function = torch.nn.NLLLoss()
+    loss_function = PackedLoss()
     if data_hyperparameters.USE_CUDA:
         model.cuda()
-    optimiser = torch.optim.Adam(model.parameters()) if model.latest_scheduled_lr is None else torch.optim.Adam(
-        model.parameters(), lr=model.latest_scheduled_lr)
+    optimiser = torch.optim.Adam(model.parameters()) if model.latest_scheduled_lr is None else torch.optim.Adam(model.parameters(), lr=model.latest_scheduled_lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimiser, patience=patience)
     now_begin_training = datetime.now()
     start_epoch = model.num_epochs_trained
@@ -36,7 +35,7 @@ def train(model, train_data, valid_data, epochs=data_hyperparameters.EPOCHS, pat
             if data_hyperparameters.USE_CUDA and not data_hyperparameters.STORE_DATA_ON_GPU_IF_AVAILABLE:
                 xb = xb.cuda()
                 yb = yb.cuda()
-            batch_loss = loss_function(model(xb), yb)
+            batch_loss = loss_function(model(xb, yb), yb)
             loss += batch_loss.item() / len(train_data)
             optimiser.zero_grad()
             batch_loss.backward()
@@ -63,9 +62,9 @@ def train(model, train_data, valid_data, epochs=data_hyperparameters.EPOCHS, pat
                 for xb, yb in valid_data:
                     xb = xb.cuda()
                     yb = yb.cuda()
-                    loss += loss_function(model(xb), yb).item() / len(valid_data)
+                    loss += loss_function(model(xb, yb), yb).item() / len(valid_data)
             else:
-                loss = sum([loss_function(model(xb), yb).item() for xb, yb in valid_data]) / len(valid_data)
+                loss = sum([loss_function(model(xb, yb), yb).item() for xb, yb in valid_data]) / len(valid_data)
         model.valid_losses.append(loss)
         scheduler.step(loss)
         write_log('Validation loss: {0}'.format(loss), logger)

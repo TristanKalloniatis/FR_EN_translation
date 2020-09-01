@@ -3,7 +3,7 @@ import data_hyperparameters
 import os
 from abc import ABC
 import matplotlib.pyplot as plt
-from datetime import datetime
+import datetime
 from math import nan
 
 
@@ -25,12 +25,15 @@ def get_accuracy(loader, model, also_report_model_confidences=False):
             if data_hyperparameters.USE_CUDA and not data_hyperparameters.STORE_DATA_ON_GPU_IF_AVAILABLE:
                 xb = xb.cuda()
                 yb = yb.cuda()
-            model_output = model(xb)
-            accuracy += model_output.argmax(dim=1).eq(yb).float().mean().item()
+            model_output = model(xb, yb)
+            yb_length = torch.sum(yb != data_hyperparameters.PAD_TOKEN, dim=-1)
+            packed_model_output_data = torch.nn.utils.rnn.pack_padded_sequence(model_output, yb_length, batch_first=True, enforce_sorted=False).data
+            packed_yb_data = torch.nn.utils.rnn.pack_padded_sequence(yb, yb_length, batch_first=True, enforce_sorted=False).data
+            accuracy += packed_model_output_data.argmax(dim=1).eq(packed_yb_data).float().mean().item()
             if also_report_model_confidences:
-                log_probs, predictions = torch.max(model_output, dim=-1)
+                log_probs, predictions = torch.max(packed_model_output_data, dim=-1)
                 probs = torch.exp(log_probs)
-                correct_predictions_mask = torch.where(predictions == yb, torch.ones_like(yb), torch.zeros_like(yb))
+                correct_predictions_mask = torch.where(predictions == packed_yb_data, torch.ones_like(packed_yb_data), torch.zeros_like(packed_yb_data))
                 num_correct += torch.sum(correct_predictions_mask).item()
                 num_incorrect += torch.sum(1 - correct_predictions_mask).item()
                 correct_prediction_probs += torch.sum(correct_predictions_mask * probs).item()
@@ -53,8 +56,6 @@ class BaseModelClass(torch.nn.Module, ABC):
         self.num_trainable_params = 0
         self.instantiated = datetime.datetime.now()
         self.name = ''
-        self.vocab_size = data_hyperparameters.VOCAB_SIZE
-        self.tokenizer = data_hyperparameters.TOKENIZER
         self.batch_size = data_hyperparameters.BATCH_SIZE
         self.train_accuracies = {}
         self.valid_accuracies = {}
@@ -81,7 +82,7 @@ class BaseModelClass(torch.nn.Module, ABC):
                       'num_epochs': self.num_epochs_trained, 'trainable_params': self.num_trainable_params,
                       'final_train_loss': final_train_loss, 'final_valid_loss': final_valid_loss,
                       'model_created': self.instantiated, 'average_time_per_epoch': average_time_per_epoch,
-                      'vocab_size': self.vocab_size, 'tokenizer': self.tokenizer, 'batch_size': self.batch_size}
+                      'batch_size': self.batch_size}
         return model_data
 
     def plot_losses(self, include_lrs=True):
@@ -134,18 +135,20 @@ class BaseModelClass(torch.nn.Module, ABC):
             plt.savefig('learning_curves/learning_rates_{0}.png'.format(self.name))
 
 
-class EncoderGRU(torch.nn.Module):
-    def __init__(self, lang, num_layers, hidden_size, dropout, use_packing, name):
+class EncoderGRU(BaseModelClass):
+    def __init__(self, lang, num_layers, hidden_size, embedding_dimension, dropout, use_packing, name):
         super().__init__()
         self.hidden_size = hidden_size
         self.use_packing = use_packing
         self.num_layers = num_layers
-        self.embedding = torch.nn.Embedding(lang.n_words, hidden_size, padding_idx=data_hyperparameters.PAD_TOKEN)
+        self.embedding_dimension = embedding_dimension
+        self.embedding = torch.nn.Embedding(lang.n_words, embedding_dimension, padding_idx=data_hyperparameters.PAD_TOKEN)
         self.dropout = torch.nn.Dropout(p=dropout)
-        self.GRU = torch.nn.GRU(num_layers=num_layers, input_size=hidden_size, hidden_size=hidden_size,
+        self.GRU = torch.nn.GRU(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size,
                                 batch_first=True, dropout=dropout)
         self.language_name = lang.name
         self.name = name
+        self.finish_setup()
 
     def forward(self, inputs):
         embeds = self.dropout(self.embedding(inputs))
@@ -159,22 +162,24 @@ class EncoderGRU(torch.nn.Module):
         return gru_output, gru_hn
 
 
-class DecoderGRU(torch.nn.Module):
-    def __init__(self, lang, num_layers, hidden_size, dropout, use_packing, use_attention, name):
+class DecoderGRU(BaseModelClass):
+    def __init__(self, lang, num_layers, hidden_size, embedding_dimension, dropout, use_packing, use_attention, name):
         super().__init__()
         self.hidden_size = hidden_size
         self.use_packing = use_packing
         self.use_attention = use_attention
         self.num_layers = num_layers
-        self.embedding = torch.nn.Embedding(lang.n_words, hidden_size, padding_idx=data_hyperparameters.PAD_TOKEN)
+        self.embedding_dimension = embedding_dimension
+        self.embedding = torch.nn.Embedding(lang.n_words, embedding_dimension, padding_idx=data_hyperparameters.PAD_TOKEN)
         self.dropout = torch.nn.Dropout(p=dropout)
-        self.GRU = torch.nn.GRU(num_layers=num_layers, input_size=hidden_size, hidden_size=hidden_size,
+        self.GRU = torch.nn.GRU(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size,
                                 batch_first=True, dropout=dropout)
         self.linear = torch.nn.Linear(hidden_size, lang.n_words)
         self.language_name = lang.name
         if use_attention:
             print('Attention not yet implemented')
         self.name = name
+        self.finish_setup()
 
     def forward(self, inputs, encoder_output, encoder_hn):
         embeds = self.dropout(self.embedding(inputs))
@@ -188,20 +193,36 @@ class DecoderGRU(torch.nn.Module):
         return torch.nn.functional.log_softmax(out, dim=-1)
 
 
-class EncoderDecoderGRU(torch.nn.Module):
+class EncoderDecoderGRU(BaseModelClass):
     def __init__(self, input_lang, output_lang, num_layers=1, hidden_size=data_hyperparameters.HIDDEN_SIZE,
-                 dropout=data_hyperparameters.DROPOUT, use_packing=True, use_attention=False, name='GRU'):
+                 embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION, dropout=data_hyperparameters.DROPOUT,
+                 use_packing=True, use_attention=False, name='GRU'):
         super().__init__()
         self.hidden_size = hidden_size
         self.use_packing = use_packing
         self.use_attention = use_attention
         self.num_layers = num_layers
+        self.embedding_dimension = embedding_dimension
         self.input_language_name = input_lang.name
         self.output_lang_name = output_lang.name
-        self.encoder = EncoderGRU(input_lang, num_layers, hidden_size, dropout, use_packing, name)
-        self.decoder = DecoderGRU(output_lang, num_layers, hidden_size, dropout, use_packing, use_attention, name)
+        self.encoder = EncoderGRU(input_lang, num_layers, hidden_size, embedding_dimension, dropout, use_packing, name)
+        self.decoder = DecoderGRU(output_lang, num_layers, hidden_size, embedding_dimension, dropout, use_packing,
+                                  use_attention, name)
         self.name = name
+        self.finish_setup()
 
     def forward(self, inputs, outputs):
         encoder_output, encoder_hn = self.encoder(inputs)
         return self.decoder(outputs, encoder_output, encoder_hn)
+
+
+class PackedLoss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.loss_function = torch.nn.NLLLoss()
+
+    def forward(self, pred_probs, actuals):
+        actuals_length = torch.sum(actuals != data_hyperparameters.PAD_TOKEN, dim=-1)
+        packed_pred_probs_data = torch.nn.utils.rnn.pack_padded_sequence(pred_probs, actuals_length, batch_first=True, enforce_sorted=False).data
+        packed_actuals_data = torch.nn.utils.rnn.pack_padded_sequence(actuals, actuals_length, batch_first=True, enforce_sorted=False).data
+        return self.loss_function(packed_pred_probs_data, packed_actuals_data)
