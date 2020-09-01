@@ -2,7 +2,6 @@ import unicodedata
 import re
 import torch
 import data_hyperparameters
-import pickle
 from log_utils import create_logger, write_log
 from sklearn.model_selection import train_test_split
 
@@ -10,12 +9,6 @@ LOG_FILE = 'data_downloader'
 logger = create_logger(LOG_FILE)
 device = torch.device('cuda' if data_hyperparameters.USE_CUDA and data_hyperparameters.STORE_DATA_ON_GPU_IF_AVAILABLE else 'cpu')
 DATA_FILE = 'data/eng-fra.txt'
-
-
-def save_data(data, path):
-    output = open(path, 'wb')
-    pickle.dump(data, output)
-    output.close()
 
 
 class Language:
@@ -57,7 +50,7 @@ def normalize_string(s):
 
 
 def read_langs():
-    write_log("Reading lines...", logger)
+    write_log('Reading lines...', logger)
     # Read the file and split into lines
     lines = open(DATA_FILE, encoding='utf-8').read().strip().split('\n')
     # Split every line into pairs and normalize
@@ -88,21 +81,21 @@ def filter_pairs(pairs):
     return [pair for pair in pairs if filter_pair(pair)]
 
 
-def split_data(input_lang_tokens, output_lang_tokens):
+def split_data(input_lang_tokens, output_lang_tokens, test_size):
     write_log('Splitting fit data into training and validation sets', logger)
-    return train_test_split(input_lang_tokens, output_lang_tokens, test_size=data_hyperparameters.TRAIN_VALID_SPLIT)
+    return train_test_split(input_lang_tokens, output_lang_tokens, test_size=test_size)
 
 
 def prepare_data():
     input_lang, output_lang, pairs = read_langs()
-    write_log("Read {0} sentence pairs".format(len(pairs)), logger)
+    write_log('Read {0} sentence pairs'.format(len(pairs)), logger)
     pairs = filter_pairs(pairs)
-    write_log("Trimmed to {0} sentence pairs".format(len(pairs)), logger)
-    write_log("Counting words...", logger)
+    write_log('Trimmed to {0} sentence pairs'.format(len(pairs)), logger)
+    write_log('Counting words...', logger)
     for pair in pairs:
         input_lang.add_sentence(pair[0])
         output_lang.add_sentence(pair[1])
-    write_log("Counted words:", logger)
+    write_log('Counted words:', logger)
     write_log('{0}: {1}'.format(input_lang.name, input_lang.n_words), logger)
     write_log('{0}: {1}'.format(output_lang.name, output_lang.n_words), logger)
     return input_lang, output_lang, pairs
@@ -116,12 +109,15 @@ def get_langs_and_loaders():
     output_word_to_index = [
         [data_hyperparameters.SOS_TOKEN] + [output_lang.word_to_index[word] for word in pair[1].split()] + [
             data_hyperparameters.EOS_TOKEN] for pair in pairs]
-    input_train, input_valid, output_train, output_valid = split_data(input_word_to_index, output_word_to_index)
+    input_train, input_test, output_train, output_test = split_data(input_word_to_index, output_word_to_index, test_size=data_hyperparameters.TRAIN_TEST_SPLIT)
+    input_train, input_valid, output_train, output_valid = split_data(input_train, output_train, test_size=data_hyperparameters.TRAIN_VALID_SPLIT)
     train_data_loader = get_dataloader(input_train, output_train)
     write_log('{0} batches in training data'.format(len(train_data_loader)), logger)
     valid_data_loader = get_dataloader(input_valid, output_valid)
     write_log('{0} batches in validation data'.format(len(valid_data_loader)), logger)
-    return input_lang, output_lang, train_data_loader, valid_data_loader
+    test_data_loader = get_dataloader(input_test, output_test)
+    write_log('{0} batches in test data'.format(len(test_data_loader)), logger)
+    return input_lang, output_lang, train_data_loader, valid_data_loader, test_data_loader
 
 
 def augment_dataset(input_dataset, output_dataset):
