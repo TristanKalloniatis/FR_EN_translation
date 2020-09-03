@@ -29,7 +29,7 @@ def get_accuracy(loader, model, also_report_model_confidences=False):
             yb_length = torch.sum(yb != data_hyperparameters.PAD_TOKEN, dim=-1)
             packed_model_output_data = torch.nn.utils.rnn.pack_padded_sequence(model_output, yb_length, batch_first=True, enforce_sorted=False).data
             packed_yb_data = torch.nn.utils.rnn.pack_padded_sequence(yb, yb_length, batch_first=True, enforce_sorted=False).data
-            accuracy += packed_model_output_data.argmax(dim=1).eq(packed_yb_data).float().mean().item()
+            accuracy += packed_model_output_data.argmax(dim=-1).eq(packed_yb_data).float().mean().item()
             if also_report_model_confidences:
                 log_probs, predictions = torch.max(packed_model_output_data, dim=-1)
                 probs = torch.exp(log_probs)
@@ -144,8 +144,7 @@ class EncoderGRU(BaseModelClass):
         self.embedding_dimension = embedding_dimension
         self.embedding = torch.nn.Embedding(lang.n_words, embedding_dimension, padding_idx=data_hyperparameters.PAD_TOKEN)
         self.dropout = torch.nn.Dropout(p=dropout)
-        self.GRU = torch.nn.GRU(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size,
-                                batch_first=True, dropout=dropout)
+        self.GRU = torch.nn.GRU(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True, dropout=dropout) if num_layers > 1 else torch.nn.GRU(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True)
         self.language_name = lang.name
         self.name = name
         self.finish_setup()
@@ -172,8 +171,7 @@ class DecoderGRU(BaseModelClass):
         self.embedding_dimension = embedding_dimension
         self.embedding = torch.nn.Embedding(lang.n_words, embedding_dimension, padding_idx=data_hyperparameters.PAD_TOKEN)
         self.dropout = torch.nn.Dropout(p=dropout)
-        self.GRU = torch.nn.GRU(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size,
-                                batch_first=True, dropout=dropout)
+        self.GRU = torch.nn.GRU(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True, dropout=dropout) if num_layers > 1 else torch.nn.GRU(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True)
         self.linear = torch.nn.Linear(hidden_size, lang.n_words)
         self.language_name = lang.name
         if use_attention:
@@ -181,16 +179,43 @@ class DecoderGRU(BaseModelClass):
         self.name = name
         self.finish_setup()
 
-    def forward(self, inputs, encoder_output, encoder_hn):
-        embeds = self.dropout(self.embedding(inputs))
-        if self.use_packing:
-            input_length = torch.sum(inputs != data_hyperparameters.PAD_TOKEN, dim=-1)
-            embeds = torch.nn.utils.rnn.pack_padded_sequence(embeds, input_length, enforce_sorted=False, batch_first=True)
-        gru_output, _ = self.GRU(embeds)
-        if self.use_packing:
-            gru_output, _ = torch.nn.utils.rnn.pad_packed_sequence(gru_output, batch_first=True)
-        out = self.linear(gru_output)
-        return torch.nn.functional.log_softmax(out, dim=-1)
+    def forward(self, inputs, encoder_output, encoder_hn, mode='forcing', return_sequences=False):
+        if mode.lower() == 'forcing':
+            embeds = self.dropout(self.embedding(inputs))
+            if self.use_packing:
+                input_length = torch.sum(inputs != data_hyperparameters.PAD_TOKEN, dim=-1)
+                embeds = torch.nn.utils.rnn.pack_padded_sequence(embeds, input_length, enforce_sorted=False, batch_first=True)
+            gru_output, _ = self.GRU(embeds, encoder_hn)
+            if self.use_packing:
+                gru_output, _ = torch.nn.utils.rnn.pad_packed_sequence(gru_output, batch_first=True)
+            out = self.linear(gru_output)
+            return torch.nn.functional.log_softmax(out, dim=-1)
+        else:
+            batch_size = encoder_output.shape[0]
+            translation = [data_hyperparameters.SOS_TOKEN] * batch_size
+            translation = torch.tensor(translation).unsqueeze(-1)
+            max_log_probs = torch.zeros(batch_size, 1)
+            if data_hyperparameters.USE_CUDA:
+                translation = translation.cuda()
+                max_log_probs = max_log_probs.cuda()
+            for _ in range(data_hyperparameters.MAX_LENGTH):
+                embeds = self.dropout(self.embedding(translation))
+                if self.use_packing:
+                    translation_length = torch.sum(translation != data_hyperparameters.PAD_TOKEN, dim=-1)
+                    embeds = torch.nn.utils.rnn.pack_padded_sequence(embeds, translation_length, enforce_sorted=False,
+                                                                     batch_first=True)
+                gru_output, _ = self.GRU(embeds, encoder_hn)
+                if self.use_packing:
+                    gru_output, _ = torch.nn.utils.rnn.pad_packed_sequence(gru_output, batch_first=True)
+                out = self.linear(gru_output)
+                log_probs = torch.nn.functional.log_softmax(out, dim=-1)
+                next_max_log_probs, next_indices = torch.max(log_probs, dim=-1)
+                next_max_log_probs = next_max_log_probs[:, -1].unsqueeze(-1)
+                next_indices = next_indices[:, -1].unsqueeze(-1)
+                translation = torch.cat([translation, next_indices], dim=-1)
+                max_log_probs = torch.cat([max_log_probs, next_max_log_probs], dim=-1)
+            return max_log_probs, translation if return_sequences else max_log_probs
+
 
 
 class EncoderDecoderGRU(BaseModelClass):
@@ -211,9 +236,9 @@ class EncoderDecoderGRU(BaseModelClass):
         self.name = name
         self.finish_setup()
 
-    def forward(self, inputs, outputs):
+    def forward(self, inputs, outputs, mode='forcing', return_sequences=False):
         encoder_output, encoder_hn = self.encoder(inputs)
-        return self.decoder(outputs, encoder_output, encoder_hn)
+        return self.decoder(outputs, encoder_output, encoder_hn, mode, return_sequences)
 
 
 class PositionalEncoding(torch.nn.Module):
@@ -262,20 +287,47 @@ class Transformer(BaseModelClass, ABC):
         self.linear = torch.nn.Linear(embedding_dimension, output_lang.n_words)
         self.finish_setup()
 
-    def forward(self, inputs, outputs):
-        input_truncated = inputs[:, :self.max_len]
-        output_truncated = outputs[:, :self.max_len]
-        input_embeds = self.input_embedding(input_truncated).transpose(0, 1)
-        output_embeds = self.output_embedding(output_truncated).transpose(0, 1)
-        input_positional_encodings = self.input_positional_encoder(input_embeds)
-        output_positional_encodings = self.output_positional_encoder(output_embeds)
-        src_key_padding_mask = (input_truncated == data_hyperparameters.PAD_TOKEN)
-        tgt_key_padding_mask = (output_truncated == data_hyperparameters.PAD_TOKEN)
-        transforms = self.transformer(input_positional_encodings, output_positional_encodings,
-                                      src_key_padding_mask=src_key_padding_mask,
-                                      tgt_key_padding_mask=tgt_key_padding_mask)
-        out = self.linear(transforms.transpose(0, 1))
-        return torch.nn.functional.log_softmax(out, dim=-1)
+    def forward(self, inputs, outputs, mode='forcing', return_sequences=False):
+        if mode.lower() == 'forcing':
+            input_truncated = inputs[:, :self.max_len]
+            output_truncated = outputs[:, :self.max_len]
+            input_embeds = self.input_embedding(input_truncated).transpose(0, 1)
+            output_embeds = self.output_embedding(output_truncated).transpose(0, 1)
+            input_positional_encodings = self.input_positional_encoder(input_embeds)
+            output_positional_encodings = self.output_positional_encoder(output_embeds)
+            src_key_padding_mask = (input_truncated == data_hyperparameters.PAD_TOKEN)
+            tgt_key_padding_mask = (output_truncated == data_hyperparameters.PAD_TOKEN)
+            transforms = self.transformer(input_positional_encodings, output_positional_encodings,
+                                          src_key_padding_mask=src_key_padding_mask,
+                                          tgt_key_padding_mask=tgt_key_padding_mask)
+            out = self.linear(transforms.transpose(0, 1))
+            return torch.nn.functional.log_softmax(out, dim=-1)
+        else:
+            batch_size = inputs.shape[0]
+            translation = [data_hyperparameters.SOS_TOKEN] * batch_size
+            translation = torch.tensor(translation).unsqueeze(-1)
+            max_log_probs = torch.zeros(batch_size, 1)
+            if data_hyperparameters.USE_CUDA:
+                translation = translation.cuda()
+                max_log_probs = max_log_probs.cuda()
+            for _ in range(data_hyperparameters.MAX_LENGTH):
+                input_embeds = self.input_embedding(inputs).transpose(0, 1)
+                output_embeds = self.output_embedding(translation).transpose(0, 1)
+                input_positional_encodings = self.input_positional_encoder(input_embeds)
+                output_positional_encodings = self.output_positional_encoder(output_embeds)
+                src_key_padding_mask = (inputs == data_hyperparameters.PAD_TOKEN)
+                tgt_key_padding_mask = (translation == data_hyperparameters.PAD_TOKEN)
+                transforms = self.transformer(input_positional_encodings, output_positional_encodings,
+                                              src_key_padding_mask=src_key_padding_mask,
+                                              tgt_key_padding_mask=tgt_key_padding_mask)
+                out = self.linear(transforms.transpose(0, 1))
+                log_probs = torch.nn.functional.log_softmax(out, dim=-1)
+                next_max_log_probs, next_indices = torch.max(log_probs, dim=-1)
+                next_max_log_probs = next_max_log_probs[:, -1].unsqueeze(-1)
+                next_indices = next_indices[:, -1].unsqueeze(-1)
+                translation = torch.cat([translation, next_indices], dim=-1)
+                max_log_probs = torch.cat([max_log_probs, next_max_log_probs], dim=-1)
+            return max_log_probs, translation if return_sequences else max_log_probs
 
 
 class PackedLoss(torch.nn.Module):

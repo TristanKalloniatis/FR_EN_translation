@@ -6,6 +6,8 @@ import csv
 from log_utils import create_logger, write_log
 from model_classes import get_accuracy, PackedLoss
 from pickle import dump, load
+from data_downloader import normalize_string
+import numpy as np
 
 LOG_FILE = 'model_pipeline'
 logger = create_logger(LOG_FILE)
@@ -135,3 +137,23 @@ def load_model_state(model, model_name):
     model.train_accuracies = model_data['train_accuracies']
     model.valid_accuracies = model_data['valid_accuracies']
     write_log('Loaded model {0} state'.format(model_name), logger)
+
+
+def translate_sentence(model, sentences, input_language, output_language): # todo: fix for sentences of differing length
+    normalised_sentences = [normalize_string(sentence) for sentence in sentences]
+    indexed_input = [[data_hyperparameters.SOS_TOKEN] + [input_language.word_to_index[word] for word in normalised_sentence.split()] + [data_hyperparameters.EOS_TOKEN] for normalised_sentence in normalised_sentences]
+    model_input = torch.tensor(indexed_input, dtype=torch.long)
+    with torch.no_grad():
+        if data_hyperparameters.USE_CUDA:
+            model_input = model_input.cuda()
+            model.cuda()
+        _, predicted_indices = model(model_input, None, mode='sampling', return_sequences=True)
+        if data_hyperparameters.USE_CUDA:
+            model.cpu()
+            predicted_indices = predicted_indices.cpu()
+        predicted_indices = predicted_indices.numpy().tolist()
+        for i in range(len(sentences)):
+            write_log('Input sentence: {0}'.format(sentences[i]), logger)
+            translation_words = [output_language.index_to_word[j] + ' ' for j in predicted_indices[i]]
+            translation = ''.join(c for c in translation_words).strip()
+            write_log('Translation: {0}'.format(translation), logger)
