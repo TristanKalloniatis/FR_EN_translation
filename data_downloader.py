@@ -14,11 +14,11 @@ DATA_FILE = 'data/eng-fra.txt'
 class Language:
     def __init__(self, name):
         self.name = name
-        self.word_to_index = {'SOS': data_hyperparameters.SOS_TOKEN, 'EOS': data_hyperparameters.EOS_TOKEN,
-                              'PAD': data_hyperparameters.PAD_TOKEN, 'UNK': data_hyperparameters.UNK_TOKEN}
+        self.word_to_index = {'<SOS>': data_hyperparameters.SOS_TOKEN, '<EOS>': data_hyperparameters.EOS_TOKEN,
+                              '<PAD>': data_hyperparameters.PAD_TOKEN, '<UNK>': data_hyperparameters.UNK_TOKEN}
         self.word_to_count = {}
-        self.index_to_word = {data_hyperparameters.SOS_TOKEN: 'SOS', data_hyperparameters.EOS_TOKEN: 'EOS',
-                              data_hyperparameters.PAD_TOKEN: 'PAD', data_hyperparameters.UNK_TOKEN: 'UNK'}
+        self.index_to_word = {data_hyperparameters.SOS_TOKEN: '<SOS>', data_hyperparameters.EOS_TOKEN: '<EOS>',
+                              data_hyperparameters.PAD_TOKEN: '<PAD>', data_hyperparameters.UNK_TOKEN: '<UNK>'}
         self.n_words = 4
 
     def add_sentence(self, sentence):
