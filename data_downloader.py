@@ -1,18 +1,103 @@
 import unicodedata
 import re
 import torch
+import spacy
 import data_hyperparameters
 from log_utils import create_logger, write_log
 from sklearn.model_selection import train_test_split
+import pickle
+import os
 
 LOG_FILE = 'data_downloader'
 logger = create_logger(LOG_FILE)
 device = torch.device('cuda' if data_hyperparameters.USE_CUDA and data_hyperparameters.STORE_DATA_ON_GPU_IF_AVAILABLE else 'cpu')
 DATA_FILE = 'data/eng-fra.txt'
+EN_WORD_TO_INDEX_FILE = 'english_WORD_TO_INDEX.pkl'
+EN_WORD_TO_COUNT_FILE = 'english_WORD_TO_COUNT.pkl'
+EN_INDEX_TO_WORD_FILE = 'english_INDEX_TO_WORD.pkl'
+FR_WORD_TO_INDEX_FILE = 'french_WORD_TO_INDEX.pkl'
+FR_WORD_TO_COUNT_FILE = 'french_WORD_TO_COUNT.pkl'
+FR_INDEX_TO_WORD_FILE = 'french_INDEX_TO_WORD.pkl'
+EN_FIT_INDEX_FILE = 'english_FIT_INDEX.pkl'
+EN_VALID_INDEX_FILE = 'english_VALID_INDEX.pkl'
+EN_TEST_INDEX_FILE = 'english_TEST_INDEX.pkl'
+FR_FIT_INDEX_FILE = 'french_FIT_INDEX.pkl'
+FR_VALID_INDEX_FILE = 'french_VALID_INDEX.pkl'
+FR_TEST_INDEX_FILE = 'french_TEST_INDEX.pkl'
+
+
+def save_data(data, path):
+    output = open(path, 'wb')
+    pickle.dump(data, output)
+    output.close()
+
+
+def prepare_data():
+    english = Language('english')
+    french = Language('french')
+    if not os.path.exists(EN_WORD_TO_INDEX_FILE) or not os.path.exists(EN_WORD_TO_COUNT_FILE) or not os.path.exists(EN_INDEX_TO_WORD_FILE) or not os.path.exists(FR_WORD_TO_INDEX_FILE) or not os.path.exists(FR_WORD_TO_COUNT_FILE) or not os.path.exists(FR_INDEX_TO_WORD_FILE) or not os.path.exists(EN_FIT_INDEX_FILE) or not os.path.exists(EN_VALID_INDEX_FILE) or not os.path.exists(EN_TEST_INDEX_FILE) or not os.path.exists(FR_FIT_INDEX_FILE) or not os.path.exists(FR_VALID_INDEX_FILE) or not os.path.exists(FR_TEST_INDEX_FILE):
+        en_sentences = []
+        fr_sentences = []
+        en_tokenizer = spacy.load('en').tokenizer
+        fr_tokenizer = spacy.load('fr').tokenizer
+        write_log('Reading sentence pairs from file', logger)
+        with open(DATA_FILE, mode='r', encoding='utf-8') as f:
+            for line in f:
+                en_sentence, fr_sentence = line.strip().split('\t')
+                en_sentence = [t.text for t in en_tokenizer(normalize_string(en_sentence))]
+                fr_sentence = [t.text for t in fr_tokenizer(normalize_string(fr_sentence))]
+                #todo: remove this filtration
+                if len(en_sentence) > data_hyperparameters.MAX_LENGTH or len(fr_sentence) > data_hyperparameters.MAX_LENGTH:
+                    continue
+                en_sentences.append(en_sentence)
+                fr_sentences.append(fr_sentence)
+        write_log('Splitting data', logger)
+        en_sentences_train, en_sentences_test, fr_sentences_train, fr_sentences_test = train_test_split(en_sentences,
+                                                                                                        fr_sentences,
+                                                                                                        test_size=data_hyperparameters.TRAIN_TEST_SPLIT)
+        en_sentences_fit, en_sentences_valid, fr_sentences_fit, fr_sentences_valid = train_test_split(en_sentences_train,
+                                                                                                      fr_sentences_train,
+                                                                                                      test_size=data_hyperparameters.TRAIN_VALID_SPLIT)
+        write_log('Building languages', logger)
+        english.read(en_sentences_fit)
+        english.cache()
+        french.read(fr_sentences_fit)
+        french.cache()
+        write_log('Indexing sentences', logger)
+        en_sentences_fit_index = english.index_sentences(en_sentences_fit)
+        save_data(en_sentences_fit_index, EN_FIT_INDEX_FILE)
+        en_sentences_valid_index = english.index_sentences(en_sentences_valid)
+        save_data(en_sentences_valid_index, EN_VALID_INDEX_FILE)
+        en_sentences_test_index = english.index_sentences(en_sentences_test)
+        save_data(en_sentences_test_index, EN_TEST_INDEX_FILE)
+        fr_sentences_fit_index = french.index_sentences(fr_sentences_fit)
+        save_data(fr_sentences_fit_index, FR_FIT_INDEX_FILE)
+        fr_sentences_valid_index = french.index_sentences(fr_sentences_valid)
+        save_data(fr_sentences_valid_index, FR_VALID_INDEX_FILE)
+        fr_sentences_test_index = french.index_sentences(fr_sentences_test)
+        save_data(fr_sentences_test_index, FR_TEST_INDEX_FILE)
+    else:
+        write_log('Loading languages from disk', logger)
+        english.load()
+        french.load()
+        write_log('Loading indexed sentences from disk', logger)
+        en_sentences_fit_index = pickle.load(open(EN_FIT_INDEX_FILE, 'rb'))
+        en_sentences_valid_index = pickle.load(open(EN_VALID_INDEX_FILE, 'rb'))
+        en_sentences_test_index = pickle.load(open(EN_TEST_INDEX_FILE, 'rb'))
+        fr_sentences_fit_index = pickle.load(open(FR_FIT_INDEX_FILE, 'rb'))
+        fr_sentences_valid_index = pickle.load(open(FR_VALID_INDEX_FILE, 'rb'))
+        fr_sentences_test_index = pickle.load(open(FR_TEST_INDEX_FILE, 'rb'))
+    train_data_loader = get_dataloader(fr_sentences_fit_index, en_sentences_fit_index)
+    write_log('{0} batches in training data'.format(len(train_data_loader)), logger)
+    valid_data_loader = get_dataloader(fr_sentences_valid_index, en_sentences_valid_index)
+    write_log('{0} batches in validation data'.format(len(valid_data_loader)), logger)
+    test_data_loader = get_dataloader(fr_sentences_test_index, en_sentences_test_index)
+    write_log('{0} batches in test data'.format(len(test_data_loader)), logger)
+    return french, english, train_data_loader, valid_data_loader, test_data_loader
 
 
 class Language:
-    def __init__(self, name):
+    def __init__(self, name, min_occurences=data_hyperparameters.MIN_OCCURENCES):
         self.name = name
         self.word_to_index = {'<SOS>': data_hyperparameters.SOS_TOKEN, '<EOS>': data_hyperparameters.EOS_TOKEN,
                               '<PAD>': data_hyperparameters.PAD_TOKEN, '<UNK>': data_hyperparameters.UNK_TOKEN}
@@ -20,19 +105,37 @@ class Language:
         self.index_to_word = {data_hyperparameters.SOS_TOKEN: '<SOS>', data_hyperparameters.EOS_TOKEN: '<EOS>',
                               data_hyperparameters.PAD_TOKEN: '<PAD>', data_hyperparameters.UNK_TOKEN: '<UNK>'}
         self.n_words = 4
+        self.min_occurences = min_occurences
 
-    def add_sentence(self, sentence):
-        for word in sentence.split(' '):
-            self.add_word(word)
+    def read(self, sentences):
+        for sentence in sentences:
+            for token in sentence:
+                if token in self.word_to_count:
+                    self.word_to_count[token] += 1
+                else:
+                    self.word_to_count[token] = 1
+        for token in self.word_to_count:
+            if self.word_to_count[token] >= self.min_occurences:
+                self.word_to_index[token] = self.n_words
+                self.index_to_word[self.n_words] = token
+                self.n_words += 1
+        for token in list(self.word_to_count):
+            if self.word_to_count[token] < self.min_occurences:
+                del self.word_to_count[token]
 
-    def add_word(self, word):
-        if word not in self.word_to_index:
-            self.word_to_index[word] = self.n_words
-            self.word_to_count[word] = 1
-            self.index_to_word[self.n_words] = word
-            self.n_words += 1
-        else:
-            self.word_to_count[word] += 1
+    def cache(self):
+        save_data(self.word_to_index, self.name + '_WORD_TO_INDEX.pkl')
+        save_data(self.word_to_count, self.name + '_WORD_TO_COUNT.pkl')
+        save_data(self.index_to_word, self.name + '_INDEX_TO_WORD.pkl')
+
+    def load(self):
+        self.word_to_index = pickle.load(open(self.name + '_WORD_TO_INDEX.pkl', 'rb'))
+        self.word_to_count = pickle.load(open(self.name + '_WORD_TO_COUNT.pkl', 'rb'))
+        self.index_to_word = pickle.load(open(self.name + '_INDEX_TO_WORD.pkl', 'rb'))
+        self.n_words = len(self.word_to_index)
+
+    def index_sentences(self, sentences):
+        return [[(self.word_to_index[token] if token in self.word_to_index else self.word_to_index['<UNK>']) for token in ['<SOS>'] + sentence + ['<EOS>']] for sentence in sentences]
 
 
 def unicode_to_ascii(s):
@@ -46,78 +149,7 @@ def normalize_string(s):
     s = unicode_to_ascii(s.lower().strip())
     s = re.sub(r"([.!?])", r" \1", s)
     s = re.sub(r"[^a-zA-Z.!?]+", r" ", s)
-    return s
-
-
-def read_langs():
-    write_log('Reading lines...', logger)
-    # Read the file and split into lines
-    lines = open(DATA_FILE, encoding='utf-8').read().strip().split('\n')
-    # Split every line into pairs and normalize
-    pairs = [[normalize_string(s) for s in l.split('\t')] for l in lines]
-    # Reverse pairs, make Language instances
-    pairs = [list(reversed(p)) for p in pairs]
-    input_lang = Language('fr')
-    output_lang = Language('en')
-    return input_lang, output_lang, pairs
-
-
-eng_prefixes = (
-    "i am ", "i m ",
-    "he is", "he s ",
-    "she is", "she s ",
-    "you are", "you re ",
-    "we are", "we re ",
-    "they are", "they re "
-)
-
-
-def filter_pair(p):
-    return len(p[0].split(' ')) < data_hyperparameters.MAX_LENGTH and len(
-        p[1].split(' ')) < data_hyperparameters.MAX_LENGTH and p[1].startswith(eng_prefixes)
-
-
-def filter_pairs(pairs):
-    return [pair for pair in pairs if filter_pair(pair)]
-
-
-def split_data(input_lang_tokens, output_lang_tokens, test_size):
-    write_log('Splitting fit data into training and validation sets', logger)
-    return train_test_split(input_lang_tokens, output_lang_tokens, test_size=test_size)
-
-
-def prepare_data():
-    input_lang, output_lang, pairs = read_langs()
-    write_log('Read {0} sentence pairs'.format(len(pairs)), logger)
-    pairs = filter_pairs(pairs)
-    write_log('Trimmed to {0} sentence pairs'.format(len(pairs)), logger)
-    write_log('Counting words...', logger)
-    for pair in pairs:
-        input_lang.add_sentence(pair[0])
-        output_lang.add_sentence(pair[1])
-    write_log('Counted words:', logger)
-    write_log('{0}: {1}'.format(input_lang.name, input_lang.n_words), logger)
-    write_log('{0}: {1}'.format(output_lang.name, output_lang.n_words), logger)
-    return input_lang, output_lang, pairs
-
-
-def get_langs_and_loaders():
-    input_lang, output_lang, pairs = prepare_data()
-    input_word_to_index = [
-        [data_hyperparameters.SOS_TOKEN] + [input_lang.word_to_index[word] for word in pair[0].split()] + [
-            data_hyperparameters.EOS_TOKEN] for pair in pairs]
-    output_word_to_index = [
-        [data_hyperparameters.SOS_TOKEN] + [output_lang.word_to_index[word] for word in pair[1].split()] + [
-            data_hyperparameters.EOS_TOKEN] for pair in pairs]
-    input_train, input_test, output_train, output_test = split_data(input_word_to_index, output_word_to_index, test_size=data_hyperparameters.TRAIN_TEST_SPLIT)
-    input_train, input_valid, output_train, output_valid = split_data(input_train, output_train, test_size=data_hyperparameters.TRAIN_VALID_SPLIT)
-    train_data_loader = get_dataloader(input_train, output_train)
-    write_log('{0} batches in training data'.format(len(train_data_loader)), logger)
-    valid_data_loader = get_dataloader(input_valid, output_valid)
-    write_log('{0} batches in validation data'.format(len(valid_data_loader)), logger)
-    test_data_loader = get_dataloader(input_test, output_test)
-    write_log('{0} batches in test data'.format(len(test_data_loader)), logger)
-    return input_lang, output_lang, train_data_loader, valid_data_loader, test_data_loader
+    return ''.join(c for c in s if c.isalpha() or c == ' ')
 
 
 def augment_dataset(input_dataset, output_dataset):
