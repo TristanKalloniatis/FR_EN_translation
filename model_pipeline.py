@@ -7,7 +7,7 @@ from log_utils import create_logger, write_log
 from model_classes import get_accuracy
 from pickle import dump, load
 from data_downloader import normalize_string
-import numpy as np
+from random import random
 
 LOG_FILE = 'model_pipeline'
 logger = create_logger(LOG_FILE)
@@ -29,15 +29,19 @@ def train(model, train_data, valid_data, epochs=data_hyperparameters.EPOCHS, pat
         now_begin_epoch = datetime.now()
         model.latest_scheduled_lr = optimiser.param_groups[0]['lr']
         model.lr_history.append(model.latest_scheduled_lr)
-        write_log('Running epoch {0} of {1} with learning rate {2}'.format(epoch + 1, epochs + start_epoch,
-                                                                           model.latest_scheduled_lr), logger)
+        write_log('Running epoch {0} of {1} with learning rate {2} and teacher forcing rate {3}'.format(epoch + 1,
+                                                                                                        epochs + start_epoch,
+                                                                                                        model.latest_scheduled_lr,
+                                                                                                        model.teacher_forcing_proportion),
+                  logger)
         model.train()
         loss = 0.
         for xb, yb in train_data:
             if data_hyperparameters.USE_CUDA and not data_hyperparameters.STORE_DATA_ON_GPU_IF_AVAILABLE:
                 xb = xb.cuda()
                 yb = yb.cuda()
-            batch_loss = loss_function(model(xb, yb), yb)
+            teacher_force = random() < model.teacher_forcing_proportion
+            batch_loss = loss_function(torch.flatten(model(xb, yb, teacher_force=teacher_force)[1:], start_dim=0, end_dim=1), torch.flatten(yb.transpose(0, 1)[1:]))
             loss += batch_loss.item() / len(train_data)
             optimiser.zero_grad()
             batch_loss.backward()
@@ -64,9 +68,9 @@ def train(model, train_data, valid_data, epochs=data_hyperparameters.EPOCHS, pat
                 for xb, yb in valid_data:
                     xb = xb.cuda()
                     yb = yb.cuda()
-                    loss += loss_function(model(xb, yb), yb).item() / len(valid_data)
+                    loss += loss_function(torch.flatten(model(xb, yb, teacher_force=False)[1:], start_dim=0, end_dim=1), torch.flatten(yb.transpose(0, 1)[1:])).item() / len(valid_data)
             else:
-                loss = sum([loss_function(model(xb, yb), yb).item() for xb, yb in valid_data]) / len(valid_data)
+                loss = sum([loss_function(torch.flatten(model(xb, yb, teacher_force=False)[1:], start_dim=0, end_dim=1), torch.flatten(yb.transpose(0, 1)[1:])).item() for xb, yb in valid_data]) / len(valid_data)
         model.valid_losses.append(loss)
         scheduler.step(loss)
         write_log('Validation loss: {0}'.format(loss), logger)
@@ -84,6 +88,7 @@ def train(model, train_data, valid_data, epochs=data_hyperparameters.EPOCHS, pat
                 model.valid_correct_confidences[epoch + 1] = mean_correct_prediction_probs
                 model.valid_incorrect_confidences[epoch + 1] = mean_incorrect_prediction_probs
         model.num_epochs_trained += 1
+        model.teacher_forcing_proportion *= data_hyperparameters.TEACHER_FORCING_SCALE_FACTOR
         write_log('Epoch took {0} seconds'.format((datetime.now() - now_begin_epoch).total_seconds()), logger)
     model.train_time += (datetime.now() - now_begin_training).total_seconds()
     if data_hyperparameters.USE_CUDA:
@@ -137,23 +142,3 @@ def load_model_state(model, model_name):
     model.train_accuracies = model_data['train_accuracies']
     model.valid_accuracies = model_data['valid_accuracies']
     write_log('Loaded model {0} state'.format(model_name), logger)
-
-
-def translate_sentence(model, sentences, input_language, output_language): # todo: fix for sentences of differing length
-    normalised_sentences = [normalize_string(sentence) for sentence in sentences]
-    indexed_input = [[data_hyperparameters.SOS_TOKEN] + [input_language.word_to_index[word] for word in normalised_sentence.split()] + [data_hyperparameters.EOS_TOKEN] for normalised_sentence in normalised_sentences]
-    model_input = torch.tensor(indexed_input, dtype=torch.long)
-    with torch.no_grad():
-        if data_hyperparameters.USE_CUDA:
-            model_input = model_input.cuda()
-            model.cuda()
-        _, predicted_indices = model(model_input, None, mode='sampling', return_sequences=True)
-        if data_hyperparameters.USE_CUDA:
-            model.cpu()
-            predicted_indices = predicted_indices.cpu()
-        predicted_indices = predicted_indices.numpy().tolist()
-        for i in range(len(sentences)):
-            write_log('Input sentence: {0}'.format(sentences[i]), logger)
-            translation_words = [output_language.index_to_word[j] + ' ' for j in predicted_indices[i]]
-            translation = ''.join(c for c in translation_words).strip()
-            write_log('Translation: {0}'.format(translation), logger)
