@@ -142,7 +142,8 @@ class EncoderGRU(BaseModelClass):
         self.use_packing = use_packing
         self.num_layers = num_layers
         self.embedding_dimension = embedding_dimension
-        self.embedding = torch.nn.Embedding(lang.n_words, embedding_dimension, padding_idx=data_hyperparameters.PAD_TOKEN)
+        self.vocab_size = lang.n_words
+        self.embedding = torch.nn.Embedding(self.vocab_size, embedding_dimension, padding_idx=data_hyperparameters.PAD_TOKEN)
         self.dropout = torch.nn.Dropout(p=dropout)
         self.GRU = torch.nn.GRU(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True, dropout=dropout) if num_layers > 1 else torch.nn.GRU(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True)
         self.language_name = lang.name
@@ -162,59 +163,30 @@ class EncoderGRU(BaseModelClass):
 
 
 class DecoderGRU(BaseModelClass):
-    def __init__(self, lang, num_layers, hidden_size, embedding_dimension, dropout, use_packing, use_attention, name):
+    def __init__(self, lang, num_layers, hidden_size, embedding_dimension, dropout, use_attention, name):
         super().__init__()
         self.hidden_size = hidden_size
-        self.use_packing = use_packing
-        self.use_attention = use_attention
         self.num_layers = num_layers
         self.embedding_dimension = embedding_dimension
-        self.embedding = torch.nn.Embedding(lang.n_words, embedding_dimension, padding_idx=data_hyperparameters.PAD_TOKEN)
+        self.vocab_size = lang.n_words
+        self.embedding = torch.nn.Embedding(self.vocab_size, embedding_dimension,
+                                            padding_idx=data_hyperparameters.PAD_TOKEN)
         self.dropout = torch.nn.Dropout(p=dropout)
-        self.GRU = torch.nn.GRU(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True, dropout=dropout) if num_layers > 1 else torch.nn.GRU(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True)
-        self.linear = torch.nn.Linear(hidden_size, lang.n_words)
+        self.GRU = torch.nn.GRU(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size,
+                                batch_first=True, dropout=dropout) if num_layers > 1 else torch.nn.GRU(
+            num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True)
         self.language_name = lang.name
+        self.name = name
+        self.use_attention = use_attention
         if use_attention:
             print('Attention not yet implemented')
-        self.name = name
+        self.linear = torch.nn.Linear(hidden_size, lang.n_words)
         self.finish_setup()
 
-    def forward(self, inputs, encoder_output, encoder_hn, mode='forcing', return_sequences=False):
-        if mode.lower() == 'forcing':
-            embeds = self.dropout(self.embedding(inputs))
-            if self.use_packing:
-                input_length = torch.sum(inputs != data_hyperparameters.PAD_TOKEN, dim=-1)
-                embeds = torch.nn.utils.rnn.pack_padded_sequence(embeds, input_length, enforce_sorted=False, batch_first=True)
-            gru_output, _ = self.GRU(embeds, encoder_hn)
-            if self.use_packing:
-                gru_output, _ = torch.nn.utils.rnn.pad_packed_sequence(gru_output, batch_first=True)
-            out = self.linear(gru_output)
-            return torch.nn.functional.log_softmax(out, dim=-1)
-        else:
-            batch_size = encoder_output.shape[0]
-            translation = [data_hyperparameters.SOS_TOKEN] * batch_size
-            translation = torch.tensor(translation).unsqueeze(-1)
-            max_log_probs = torch.zeros(batch_size, 1)
-            if data_hyperparameters.USE_CUDA:
-                translation = translation.cuda()
-                max_log_probs = max_log_probs.cuda()
-            for _ in range(data_hyperparameters.MAX_LENGTH):
-                embeds = self.dropout(self.embedding(translation))
-                if self.use_packing:
-                    translation_length = torch.sum(translation != data_hyperparameters.PAD_TOKEN, dim=-1)
-                    embeds = torch.nn.utils.rnn.pack_padded_sequence(embeds, translation_length, enforce_sorted=False,
-                                                                     batch_first=True)
-                gru_output, _ = self.GRU(embeds, encoder_hn)
-                if self.use_packing:
-                    gru_output, _ = torch.nn.utils.rnn.pad_packed_sequence(gru_output, batch_first=True)
-                out = self.linear(gru_output)
-                log_probs = torch.nn.functional.log_softmax(out, dim=-1)
-                next_max_log_probs, next_indices = torch.max(log_probs, dim=-1)
-                next_max_log_probs = next_max_log_probs[:, -1].unsqueeze(-1)
-                next_indices = next_indices[:, -1].unsqueeze(-1)
-                translation = torch.cat([translation, next_indices], dim=-1)
-                max_log_probs = torch.cat([max_log_probs, next_max_log_probs], dim=-1)
-            return max_log_probs, translation if return_sequences else max_log_probs
+    def forward(self, inputs, encoder_output, encoder_hn):
+        embeds = self.dropout(self.embedding(inputs.unsqueeze(1)))
+        gru_output, gru_hn = self.GRU(embeds, encoder_hn)
+        return torch.nn.functional.log_softmax(self.linear(gru_output.squeeze()), dim=-1), gru_output, gru_hn
 
 
 class EncoderDecoderGRU(BaseModelClass):
@@ -230,217 +202,19 @@ class EncoderDecoderGRU(BaseModelClass):
         self.input_language_name = input_lang.name
         self.output_lang_name = output_lang.name
         self.encoder = EncoderGRU(input_lang, num_layers, hidden_size, embedding_dimension, dropout, use_packing, name)
-        self.decoder = DecoderGRU(output_lang, num_layers, hidden_size, embedding_dimension, dropout, use_packing,
-                                  use_attention, name)
+        self.decoder = DecoderGRU(output_lang, num_layers, hidden_size, embedding_dimension, dropout, use_attention,
+                                  name)
         self.name = name
         self.finish_setup()
 
-    def forward(self, inputs, outputs, mode='forcing', return_sequences=False):
+    def forward(self, inputs, outputs, teacher_force=False):
+        batch_size = outputs.shape[0]
+        output_length = outputs.shape[1]
         encoder_output, encoder_hn = self.encoder(inputs)
-        return self.decoder(outputs, encoder_output, encoder_hn, mode, return_sequences)
-
-
-class EncoderLSTM(BaseModelClass):
-    def __init__(self, lang, num_layers, hidden_size, embedding_dimension, dropout, use_packing, name):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.use_packing = use_packing
-        self.num_layers = num_layers
-        self.embedding_dimension = embedding_dimension
-        self.embedding = torch.nn.Embedding(lang.n_words, embedding_dimension, padding_idx=data_hyperparameters.PAD_TOKEN)
-        self.dropout = torch.nn.Dropout(p=dropout)
-        self.LSTM = torch.nn.LSTM(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True, dropout=dropout) if num_layers > 1 else torch.nn.GRU(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True)
-        self.language_name = lang.name
-        self.name = name
-        self.finish_setup()
-
-    def forward(self, inputs):
-        embeds = self.dropout(self.embedding(inputs))
-        if self.use_packing:
-            input_length = torch.sum(inputs != data_hyperparameters.PAD_TOKEN, dim=-1)
-            embeds = torch.nn.utils.rnn.pack_padded_sequence(embeds, input_length, enforce_sorted=False,
-                                                             batch_first=True)
-        lstm_output, (lstm_hn, _) = self.LSTM(embeds)
-        if self.use_packing:
-            lstm_output, _ = torch.nn.utils.rnn.pad_packed_sequence(lstm_output, batch_first=True)
-        return lstm_output, lstm_hn
-
-
-class DecoderLSTM(BaseModelClass):
-    def __init__(self, lang, num_layers, hidden_size, embedding_dimension, dropout, use_packing, use_attention, name):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.use_packing = use_packing
-        self.use_attention = use_attention
-        self.num_layers = num_layers
-        self.embedding_dimension = embedding_dimension
-        self.embedding = torch.nn.Embedding(lang.n_words, embedding_dimension, padding_idx=data_hyperparameters.PAD_TOKEN)
-        self.dropout = torch.nn.Dropout(p=dropout)
-        self.LSTM = torch.nn.LSTM(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True, dropout=dropout) if num_layers > 1 else torch.nn.GRU(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True)
-        self.linear = torch.nn.Linear(hidden_size, lang.n_words)
-        self.language_name = lang.name
-        if use_attention:
-            print('Attention not yet implemented')
-        self.name = name
-        self.finish_setup()
-
-    def forward(self, inputs, encoder_output, encoder_hn, mode='forcing', return_sequences=False):
-        if mode.lower() == 'forcing':
-            embeds = self.dropout(self.embedding(inputs))
-            if self.use_packing:
-                input_length = torch.sum(inputs != data_hyperparameters.PAD_TOKEN, dim=-1)
-                embeds = torch.nn.utils.rnn.pack_padded_sequence(embeds, input_length, enforce_sorted=False, batch_first=True)
-            lstm_output, _ = self.LSTM(embeds, encoder_hn)
-            if self.use_packing:
-                lstm_output, _ = torch.nn.utils.rnn.pad_packed_sequence(lstm_output, batch_first=True)
-            out = self.linear(lstm_output)
-            return torch.nn.functional.log_softmax(out, dim=-1)
-        else:
-            batch_size = encoder_output.shape[0]
-            translation = [data_hyperparameters.SOS_TOKEN] * batch_size
-            translation = torch.tensor(translation).unsqueeze(-1)
-            max_log_probs = torch.zeros(batch_size, 1)
-            if data_hyperparameters.USE_CUDA:
-                translation = translation.cuda()
-                max_log_probs = max_log_probs.cuda()
-            for _ in range(data_hyperparameters.MAX_LENGTH):
-                embeds = self.dropout(self.embedding(translation))
-                if self.use_packing:
-                    translation_length = torch.sum(translation != data_hyperparameters.PAD_TOKEN, dim=-1)
-                    embeds = torch.nn.utils.rnn.pack_padded_sequence(embeds, translation_length, enforce_sorted=False,
-                                                                     batch_first=True)
-                lstm_output, _ = self.LSTM(embeds, encoder_hn)
-                if self.use_packing:
-                    lstm_output, _ = torch.nn.utils.rnn.pad_packed_sequence(lstm_output, batch_first=True)
-                out = self.linear(lstm_output)
-                log_probs = torch.nn.functional.log_softmax(out, dim=-1)
-                next_max_log_probs, next_indices = torch.max(log_probs, dim=-1)
-                next_max_log_probs = next_max_log_probs[:, -1].unsqueeze(-1)
-                next_indices = next_indices[:, -1].unsqueeze(-1)
-                translation = torch.cat([translation, next_indices], dim=-1)
-                max_log_probs = torch.cat([max_log_probs, next_max_log_probs], dim=-1)
-            return max_log_probs, translation if return_sequences else max_log_probs
-
-
-class EncoderDecoderLSTM(BaseModelClass):
-    def __init__(self, input_lang, output_lang, num_layers=1, hidden_size=data_hyperparameters.HIDDEN_SIZE,
-                 embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION, dropout=data_hyperparameters.DROPOUT,
-                 use_packing=True, use_attention=False, name='LSTM'):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.use_packing = use_packing
-        self.use_attention = use_attention
-        self.num_layers = num_layers
-        self.embedding_dimension = embedding_dimension
-        self.input_language_name = input_lang.name
-        self.output_lang_name = output_lang.name
-        self.encoder = EncoderLSTM(input_lang, num_layers, hidden_size, embedding_dimension, dropout, use_packing, name)
-        self.decoder = DecoderLSTM(output_lang, num_layers, hidden_size, embedding_dimension, dropout, use_packing,
-                                  use_attention, name)
-        self.name = name
-        self.finish_setup()
-
-    def forward(self, inputs, outputs, mode='forcing', return_sequences=False):
-        encoder_output, encoder_hn = self.encoder(inputs)
-        return self.decoder(outputs, encoder_output, encoder_hn, mode, return_sequences)
-
-
-class PositionalEncoding(torch.nn.Module):
-    # Modified from https://github.com/pytorch/examples/blob/master/word_language_model/model.py
-    def __init__(self, d_model, dropout=0.1, max_len=1000):
-        assert d_model % 2 == 0
-        super().__init__()
-        self.dropout = torch.nn.Dropout(p=dropout)
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        # [T, B, d_model] -> [T, B, d_model]
-        x = x + self.pe[:x.size(0), :]
-        return self.dropout(x)
-
-
-class Transformer(BaseModelClass, ABC):
-    def __init__(self, input_lang, output_lang, num_layers=1, max_len=500,
-                 embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION,
-                 nhead=data_hyperparameters.ATTENTION_HEADS, dim_feedforward=data_hyperparameters.FEEDFORWARD_DIMENSION,
-                 dropout=data_hyperparameters.DROPOUT,
-                 positional_encoding_dropout=data_hyperparameters.POSITIONAL_ENCODER_DROPOUT,
-                 name='TransformerEncoder'):
-        super().__init__()
-        assert embedding_dimension % nhead == 0
-        self.max_len = max_len
-        self.name = name
-        self.input_language_name = input_lang.name
-        self.output_lang_name = output_lang.name
-        self.embedding_dimension = embedding_dimension
-        self.input_embedding = torch.nn.Embedding(input_lang.n_words, embedding_dimension,
-                                                  padding_idx=data_hyperparameters.PAD_TOKEN)
-        self.output_embedding = torch.nn.Embedding(output_lang.n_words, embedding_dimension,
-                                                   padding_idx=data_hyperparameters.PAD_TOKEN)
-        self.input_positional_encoder = PositionalEncoding(embedding_dimension, max_len=max_len,
-                                                           dropout=positional_encoding_dropout)
-        self.output_positional_encoder = PositionalEncoding(embedding_dimension, max_len=max_len,
-                                                            dropout=positional_encoding_dropout)
-        self.transformer = torch.nn.Transformer(embedding_dimension, nhead, num_layers, num_layers, dim_feedforward, dropout)
-        self.linear = torch.nn.Linear(embedding_dimension, output_lang.n_words)
-        self.finish_setup()
-
-    def forward(self, inputs, outputs, mode='forcing', return_sequences=False):
-        if mode.lower() == 'forcing':
-            input_truncated = inputs[:, :self.max_len]
-            output_truncated = outputs[:, :self.max_len]
-            input_embeds = self.input_embedding(input_truncated).transpose(0, 1)
-            output_embeds = self.output_embedding(output_truncated).transpose(0, 1)
-            input_positional_encodings = self.input_positional_encoder(input_embeds)
-            output_positional_encodings = self.output_positional_encoder(output_embeds)
-            src_key_padding_mask = (input_truncated == data_hyperparameters.PAD_TOKEN)
-            tgt_key_padding_mask = (output_truncated == data_hyperparameters.PAD_TOKEN)
-            transforms = self.transformer(input_positional_encodings, output_positional_encodings,
-                                          src_key_padding_mask=src_key_padding_mask,
-                                          tgt_key_padding_mask=tgt_key_padding_mask)
-            out = self.linear(transforms.transpose(0, 1))
-            return torch.nn.functional.log_softmax(out, dim=-1)
-        else:
-            batch_size = inputs.shape[0]
-            translation = [data_hyperparameters.SOS_TOKEN] * batch_size
-            translation = torch.tensor(translation).unsqueeze(-1)
-            max_log_probs = torch.zeros(batch_size, 1)
-            if data_hyperparameters.USE_CUDA:
-                translation = translation.cuda()
-                max_log_probs = max_log_probs.cuda()
-            for _ in range(data_hyperparameters.MAX_LENGTH):
-                input_embeds = self.input_embedding(inputs).transpose(0, 1)
-                output_embeds = self.output_embedding(translation).transpose(0, 1)
-                input_positional_encodings = self.input_positional_encoder(input_embeds)
-                output_positional_encodings = self.output_positional_encoder(output_embeds)
-                src_key_padding_mask = (inputs == data_hyperparameters.PAD_TOKEN)
-                tgt_key_padding_mask = (translation == data_hyperparameters.PAD_TOKEN)
-                transforms = self.transformer(input_positional_encodings, output_positional_encodings,
-                                              src_key_padding_mask=src_key_padding_mask,
-                                              tgt_key_padding_mask=tgt_key_padding_mask)
-                out = self.linear(transforms.transpose(0, 1))
-                log_probs = torch.nn.functional.log_softmax(out, dim=-1)
-                next_max_log_probs, next_indices = torch.max(log_probs, dim=-1)
-                next_max_log_probs = next_max_log_probs[:, -1].unsqueeze(-1)
-                next_indices = next_indices[:, -1].unsqueeze(-1)
-                translation = torch.cat([translation, next_indices], dim=-1)
-                max_log_probs = torch.cat([max_log_probs, next_max_log_probs], dim=-1)
-            return max_log_probs, translation if return_sequences else max_log_probs
-
-
-class PackedLoss(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.loss_function = torch.nn.NLLLoss()
-
-    def forward(self, pred_probs, actuals):
-        actuals_length = torch.sum(actuals != data_hyperparameters.PAD_TOKEN, dim=-1)
-        packed_pred_probs_data = torch.nn.utils.rnn.pack_padded_sequence(pred_probs, actuals_length, batch_first=True, enforce_sorted=False).data
-        packed_actuals_data = torch.nn.utils.rnn.pack_padded_sequence(actuals, actuals_length, batch_first=True, enforce_sorted=False).data
-        return self.loss_function(packed_pred_probs_data, packed_actuals_data)
+        decoder_input = outputs[:, 0]
+        decoder_outputs = torch.zeros(output_length, batch_size, self.decoder.vocab_size, device='cuda' if data_hyperparameters.USE_CUDA else 'cpu')
+        for t in range(1, output_length):
+            log_probs, decoder_output, decoder_hn = self.decoder(decoder_input, encoder_output, encoder_hn)
+            decoder_outputs[t] = log_probs
+            decoder_input = outputs[:, t] if teacher_force else log_probs.argmax(dim=-1)
+        return decoder_outputs

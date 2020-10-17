@@ -32,7 +32,7 @@ def save_data(data, path):
     output.close()
 
 
-def prepare_data():
+def prepare_data(batch_size=data_hyperparameters.BATCH_SIZE):
     english = Language('english')
     french = Language('french')
     if not os.path.exists(EN_WORD_TO_INDEX_FILE) or not os.path.exists(EN_WORD_TO_COUNT_FILE) or not os.path.exists(EN_INDEX_TO_WORD_FILE) or not os.path.exists(FR_WORD_TO_INDEX_FILE) or not os.path.exists(FR_WORD_TO_COUNT_FILE) or not os.path.exists(FR_INDEX_TO_WORD_FILE) or not os.path.exists(EN_FIT_INDEX_FILE) or not os.path.exists(EN_VALID_INDEX_FILE) or not os.path.exists(EN_TEST_INDEX_FILE) or not os.path.exists(FR_FIT_INDEX_FILE) or not os.path.exists(FR_VALID_INDEX_FILE) or not os.path.exists(FR_TEST_INDEX_FILE):
@@ -87,11 +87,11 @@ def prepare_data():
         fr_sentences_fit_index = pickle.load(open(FR_FIT_INDEX_FILE, 'rb'))
         fr_sentences_valid_index = pickle.load(open(FR_VALID_INDEX_FILE, 'rb'))
         fr_sentences_test_index = pickle.load(open(FR_TEST_INDEX_FILE, 'rb'))
-    train_data_loader = get_dataloader(fr_sentences_fit_index, en_sentences_fit_index)
+    train_data_loader = get_dataloader(fr_sentences_fit_index, en_sentences_fit_index, batch_size=batch_size)
     write_log('{0} batches in training data'.format(len(train_data_loader)), logger)
-    valid_data_loader = get_dataloader(fr_sentences_valid_index, en_sentences_valid_index)
+    valid_data_loader = get_dataloader(fr_sentences_valid_index, en_sentences_valid_index, batch_size=batch_size)
     write_log('{0} batches in validation data'.format(len(valid_data_loader)), logger)
-    test_data_loader = get_dataloader(fr_sentences_test_index, en_sentences_test_index)
+    test_data_loader = get_dataloader(fr_sentences_test_index, en_sentences_test_index, batch_size=batch_size)
     write_log('{0} batches in test data'.format(len(test_data_loader)), logger)
     return french, english, train_data_loader, valid_data_loader, test_data_loader
 
@@ -160,7 +160,7 @@ def augment_dataset(input_dataset, output_dataset):
     return samples
 
 
-def get_dataloader(input_dataset, output_dataset, batch_size=data_hyperparameters.BATCH_SIZE):
+def get_dataloader(input_dataset, output_dataset, batch_size):
     def pad_batch(batch):
         # Find max length of the batch
         max_input_len = max([sample[0] for sample in batch])

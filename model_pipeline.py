@@ -4,7 +4,7 @@ from datetime import datetime
 import os
 import csv
 from log_utils import create_logger, write_log
-from model_classes import get_accuracy, PackedLoss
+from model_classes import get_accuracy
 from pickle import dump, load
 from data_downloader import normalize_string
 import numpy as np
@@ -18,7 +18,7 @@ if not os.path.exists('saved_models/'):
 
 def train(model, train_data, valid_data, epochs=data_hyperparameters.EPOCHS, patience=data_hyperparameters.PATIENCE,
           report_accuracy_every=data_hyperparameters.REPORT_ACCURACY_EVERY):
-    loss_function = PackedLoss()
+    loss_function = torch.nn.NLLLoss(ignore_index=data_hyperparameters.PAD_TOKEN)
     if data_hyperparameters.USE_CUDA:
         model.cuda()
     optimiser = torch.optim.Adam(model.parameters()) if model.latest_scheduled_lr is None else torch.optim.Adam(model.parameters(), lr=model.latest_scheduled_lr)
