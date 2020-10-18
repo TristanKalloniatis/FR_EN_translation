@@ -28,6 +28,7 @@ def train(model, train_data, valid_data, epochs=data_hyperparameters.EPOCHS, pat
     for epoch in range(start_epoch, epochs + start_epoch):
         now_begin_epoch = datetime.now()
         model.latest_scheduled_lr = optimiser.param_groups[0]['lr']
+        model.teacher_forcing_proportion_history.append(model.teacher_forcing_proportion)
         model.lr_history.append(model.latest_scheduled_lr)
         write_log('Running epoch {0} of {1} with learning rate {2} and teacher forcing rate {3}'.format(epoch + 1,
                                                                                                         epochs + start_epoch,

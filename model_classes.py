@@ -102,6 +102,7 @@ class BaseModelClass(torch.nn.Module, ABC):
         self.name = ''
         self.batch_size = data_hyperparameters.BATCH_SIZE
         self.teacher_forcing_proportion = data_hyperparameters.TEACHER_FORCING_PROPORTION_START
+        self.teacher_forcing_proportion_history = []
         self.train_accuracies = {}
         self.valid_accuracies = {}
         self.train_correct_confidences = {}
@@ -139,6 +140,15 @@ class BaseModelClass(torch.nn.Module, ABC):
         ax.set_title('Learning curve for {0}'.format(self.name))
         ax.legend()
         plt.savefig('learning_curves/learning_curve_{0}.png'.format(self.name))
+
+        fig, ax = plt.subplots()
+        ax.plot(range(self.num_epochs_trained), self.teacher_forcing_proportion_history,
+                label='Teacher forcing proportion')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Proportion')
+        ax.set_title('Teacher forcing proportions for {0}'.format(self.name))
+        ax.legend()
+        plt.savefig('learning_curves/teacher_forcing_proportions_{0}.png'.format(self.name))
 
         if len(self.train_accuracies) != 0:
             fig, ax = plt.subplots()
