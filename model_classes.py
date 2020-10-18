@@ -10,6 +10,46 @@ if not os.path.exists('learning_curves/'):
     os.mkdir('learning_curves/')
 
 
+def _weight_drop(module, weights, dropout):
+    # Replace weight parameters by '_raw' weight parameters
+    for weight_name in weights:
+        weight = getattr(module, weight_name)
+        del module._parameters[weight_name]
+        module.register_parameter(weight_name + '_raw', torch.nn.Parameter(weight))
+    original_forward = module.forward
+
+    def forward(*args, **kwargs):
+        for weight_name in weights:
+            weight_raw = getattr(module, weight_name + '_raw')
+            weight = torch.nn.Parameter(torch.nn.functional.dropout(weight_raw, p=dropout, training=module.training),
+                                        requires_grad=True)
+            setattr(module, weight_name, weight)
+        return original_forward(*args, **kwargs)
+
+    setattr(module, 'forward', forward)
+
+
+class WeightDrop(torch.nn.Module):
+    def __init__(self, module, weights, dropout=0.0):
+        super().__init__()
+        _weight_drop(module, weights, dropout)
+        self.forward = module.forward
+
+
+class WeightDropGRU(torch.nn.GRU):
+    def __init__(self, *args, weight_dropout=0.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        weights = [f'weight_hh_l{i}' for i in range(self.num_layers)]
+        _weight_drop(self, weights, weight_dropout)
+
+
+class WeightDropLSTM(torch.nn.LSTM):
+    def __init__(self, *args, weight_dropout=0.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        weights = [f'weight_hh_l{i}' for i in range(self.num_layers)]
+        _weight_drop(self, weights, weight_dropout)
+
+
 def get_accuracy(loader, model, also_report_model_confidences=False):
     if data_hyperparameters.USE_CUDA:
         model.cuda()
@@ -141,7 +181,8 @@ class BaseModelClass(torch.nn.Module, ABC):
 
 
 class EncoderGRU(BaseModelClass):
-    def __init__(self, lang, num_layers, bidirectional, hidden_size, embedding_dimension, dropout, use_packing, name):
+    def __init__(self, lang, num_layers, bidirectional, hidden_size, embedding_dimension, embedding_dropout,
+                 inter_recurrent_layer_dropout, intra_recurrent_layer_dropout, use_packing, name):
         super().__init__()
         self.hidden_size = hidden_size
         self.use_packing = use_packing
@@ -151,10 +192,10 @@ class EncoderGRU(BaseModelClass):
         self.vocab_size = lang.n_words
         self.embedding = torch.nn.Embedding(self.vocab_size, embedding_dimension,
                                             padding_idx=data_hyperparameters.PAD_TOKEN)
-        self.dropout = torch.nn.Dropout(p=dropout)
-        self.GRU = torch.nn.GRU(num_layers=num_layers, bidirectional=bidirectional, input_size=embedding_dimension,
-                                hidden_size=hidden_size, batch_first=True,
-                                dropout=dropout) if num_layers > 1 else torch.nn.GRU(
+        self.dropout = torch.nn.Dropout(p=embedding_dropout)
+        self.GRU = WeightDropGRU(weight_dropout=intra_recurrent_layer_dropout, num_layers=num_layers,
+                                 bidirectional=bidirectional, input_size=embedding_dimension, hidden_size=hidden_size,
+                                 batch_first=True, dropout=inter_recurrent_layer_dropout) if num_layers > 1 else WeightDropGRU(weight_dropout=intra_recurrent_layer_dropout,
             num_layers=num_layers, bidirectional=bidirectional, input_size=embedding_dimension, hidden_size=hidden_size,
             batch_first=True)
         self.language_name = lang.name
@@ -170,14 +211,12 @@ class EncoderGRU(BaseModelClass):
         gru_output, gru_hn = self.GRU(embeds)
         if self.use_packing:
             gru_output, _ = torch.nn.utils.rnn.pad_packed_sequence(gru_output, batch_first=True)
-        # output = [batch, seq_len, num_directions * hidden_size]
-        # hn = [num_layers * num_directions, batch, hidden_size]
-        # h_n.view(num_layers, num_directions, batch, hidden_size)
         return gru_output, gru_hn
 
 
 class DecoderGRU(BaseModelClass):
-    def __init__(self, lang, num_layers, bidirectional, hidden_size, embedding_dimension, dropout, name):
+    def __init__(self, lang, num_layers, bidirectional, hidden_size, embedding_dimension, embedding_dropout,
+                 inter_recurrent_layer_dropout, intra_recurrent_layer_dropout, name):
         super().__init__()
         self.hidden_size = hidden_size
         self.bidirectional = bidirectional
@@ -186,10 +225,11 @@ class DecoderGRU(BaseModelClass):
         self.vocab_size = lang.n_words
         self.embedding = torch.nn.Embedding(self.vocab_size, embedding_dimension,
                                             padding_idx=data_hyperparameters.PAD_TOKEN)
-        self.dropout = torch.nn.Dropout(p=dropout)
-        self.GRU = torch.nn.GRU(num_layers=num_layers, input_size=embedding_dimension,
-                                hidden_size=2 * hidden_size if bidirectional else hidden_size,
-                                batch_first=True, dropout=dropout) if num_layers > 1 else torch.nn.GRU(
+        self.dropout = torch.nn.Dropout(p=embedding_dropout)
+        self.GRU = WeightDropGRU(weight_dropout=intra_recurrent_layer_dropout, num_layers=num_layers,
+                                 input_size=embedding_dimension,
+                                 hidden_size=2 * hidden_size if bidirectional else hidden_size, batch_first=True,
+                                 dropout=inter_recurrent_layer_dropout) if num_layers > 1 else WeightDropGRU(weight_dropout=intra_recurrent_layer_dropout,
             num_layers=num_layers, input_size=embedding_dimension,
             hidden_size=2 * hidden_size if bidirectional else hidden_size, batch_first=True)
         self.language_name = lang.name
@@ -204,8 +244,9 @@ class DecoderGRU(BaseModelClass):
         return torch.nn.functional.log_softmax(self.linear(gru_output.squeeze()), dim=-1), gru_output, gru_hn
 
 
-class DecoderGRUWithContext(BaseModelClass):
-    def __init__(self, lang, bidirectional, hidden_size, embedding_dimension, dropout, name):
+class DecoderGRUWithContext(BaseModelClass): # todo: make this work with multiple layers
+    def __init__(self, lang, bidirectional, hidden_size, embedding_dimension, embedding_dropout,
+                 inter_recurrent_layer_dropout, intra_recurrent_layer_dropout, name):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_layers = 1
@@ -214,9 +255,10 @@ class DecoderGRUWithContext(BaseModelClass):
         self.vocab_size = lang.n_words
         self.embedding = torch.nn.Embedding(self.vocab_size, embedding_dimension,
                                             padding_idx=data_hyperparameters.PAD_TOKEN)
-        self.dropout = torch.nn.Dropout(p=dropout)
-        self.GRU = torch.nn.GRU(num_layers=1, input_size=embedding_dimension + 2 * hidden_size if bidirectional else embedding_dimension + hidden_size,
-                                hidden_size=2 * hidden_size if bidirectional else hidden_size, batch_first=True)
+        self.dropout = torch.nn.Dropout(p=embedding_dropout)
+        self.GRU = WeightDropGRU(weight_dropout=intra_recurrent_layer_dropout, num_layers=1,
+                                 input_size=embedding_dimension + 2 * hidden_size if bidirectional else embedding_dimension + hidden_size,
+                                 hidden_size=2 * hidden_size if bidirectional else hidden_size, batch_first=True)
         self.language_name = lang.name
         self.name = name
         self.linear = torch.nn.Linear(4 * hidden_size + embedding_dimension if bidirectional else 2 * hidden_size + embedding_dimension,
@@ -232,10 +274,40 @@ class DecoderGRUWithContext(BaseModelClass):
         return torch.nn.functional.log_softmax(self.linear(output_with_embeds_and_context), dim=-1), gru_output, gru_hn
 
 
+class DecoderGRUWithAttention(BaseModelClass):
+    def __init__(self, lang, num_layers, bidirectional, hidden_size, embedding_dimension, embedding_dropout,
+                 inter_recurrent_layer_dropout, intra_recurrent_layer_dropout, name):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.bidirectional = bidirectional
+        self.num_layers = num_layers
+        self.embedding_dimension = embedding_dimension
+        self.vocab_size = lang.n_words
+        self.embedding = torch.nn.Embedding(self.vocab_size, embedding_dimension,
+                                            padding_idx=data_hyperparameters.PAD_TOKEN)
+        self.dropout = torch.nn.Dropout(p=embedding_dropout)
+        self.GRU = WeightDropGRU(weight_dropout=intra_recurrent_layer_dropout, num_layers=num_layers,
+                                 input_size=embedding_dimension,
+                                 hidden_size=2 * hidden_size if bidirectional else hidden_size, batch_first=True,
+                                 dropout=inter_recurrent_layer_dropout) if num_layers > 1 else WeightDropGRU(weight_dropout=intra_recurrent_layer_dropout,
+            num_layers=num_layers, input_size=embedding_dimension,
+            hidden_size=2 * hidden_size if bidirectional else hidden_size, batch_first=True)
+        self.language_name = lang.name
+        self.name = name
+        self.linear = torch.nn.Linear(2 * hidden_size if bidirectional else hidden_size, lang.n_words)
+        self.finish_setup()
+
+    def forward(self):
+        pass
+
+
 class EncoderDecoderGRU(BaseModelClass):
     def __init__(self, input_lang, output_lang, num_layers=1, bidirectional=False,
                  hidden_size=data_hyperparameters.HIDDEN_SIZE,
-                 embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION, dropout=data_hyperparameters.DROPOUT,
+                 embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION,
+                 embedding_dropout=data_hyperparameters.EMBEDDING_DROPOUT,
+                 inter_recurrent_layer_dropout=data_hyperparameters.INTER_RECURRENT_LAYER_DROPOUT,
+                 intra_recurrent_layer_dropout=data_hyperparameters.INTRA_RECURRENT_LAYER_DROPOUT,
                  use_packing=True, name='GRU'):
         super().__init__()
         self.hidden_size = hidden_size
@@ -245,8 +317,11 @@ class EncoderDecoderGRU(BaseModelClass):
         self.embedding_dimension = embedding_dimension
         self.input_language_name = input_lang.name
         self.output_lang_name = output_lang.name
-        self.encoder = EncoderGRU(input_lang, num_layers, bidirectional, hidden_size, embedding_dimension, dropout, use_packing, name)
-        self.decoder = DecoderGRU(output_lang, num_layers, bidirectional, hidden_size, embedding_dimension, dropout, name)
+        self.encoder = EncoderGRU(input_lang, num_layers, bidirectional, hidden_size, embedding_dimension,
+                                  embedding_dropout, inter_recurrent_layer_dropout, intra_recurrent_layer_dropout,
+                                  use_packing, name)
+        self.decoder = DecoderGRU(output_lang, num_layers, bidirectional, hidden_size, embedding_dimension,
+                                  embedding_dropout, inter_recurrent_layer_dropout, intra_recurrent_layer_dropout, name)
         self.name = name
         self.finish_setup()
 
@@ -266,8 +341,11 @@ class EncoderDecoderGRU(BaseModelClass):
 
 class EncoderDecoderGRUWithContext(BaseModelClass):
     def __init__(self, input_lang, output_lang, bidirectional=False, hidden_size=data_hyperparameters.HIDDEN_SIZE,
-                 embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION, dropout=data_hyperparameters.DROPOUT,
-                 use_packing=True, name='GRU'):
+                 embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION,
+                 embedding_dropout=data_hyperparameters.EMBEDDING_DROPOUT,
+                 inter_recurrent_layer_dropout=data_hyperparameters.INTER_RECURRENT_LAYER_DROPOUT,
+                 intra_recurrent_layer_dropout=data_hyperparameters.INTRA_RECURRENT_LAYER_DROPOUT, use_packing=True,
+                 name='GRUWithContext'):
         super().__init__()
         self.hidden_size = hidden_size
         self.bidirectional = bidirectional
@@ -275,10 +353,50 @@ class EncoderDecoderGRUWithContext(BaseModelClass):
         self.embedding_dimension = embedding_dimension
         self.input_language_name = input_lang.name
         self.output_lang_name = output_lang.name
-        self.encoder = EncoderGRU(input_lang, 1, bidirectional, hidden_size, embedding_dimension, dropout, use_packing,
-                                  name)
-        self.decoder = DecoderGRUWithContext(output_lang, bidirectional, hidden_size, embedding_dimension, dropout,
-                                             name)
+        self.encoder = EncoderGRU(input_lang, 1, bidirectional, hidden_size, embedding_dimension, embedding_dropout,
+                                  inter_recurrent_layer_dropout, intra_recurrent_layer_dropout, use_packing, name)
+        self.decoder = DecoderGRUWithContext(output_lang, bidirectional, hidden_size, embedding_dimension,
+                                             embedding_dropout, inter_recurrent_layer_dropout,
+                                             intra_recurrent_layer_dropout, name)
+        self.name = name
+        self.finish_setup()
+
+    def forward(self, inputs, outputs, teacher_force=False):
+        batch_size = outputs.shape[0]
+        output_length = outputs.shape[1]
+        encoder_output, encoder_hn = self.encoder(inputs)
+        decoder_input = outputs[:, 0]
+        decoder_outputs = torch.zeros(output_length, batch_size, self.decoder.vocab_size,
+                                      device='cuda' if data_hyperparameters.USE_CUDA else 'cpu')
+        for t in range(1, output_length):
+            log_probs, decoder_output, decoder_hn = self.decoder(decoder_input, encoder_output, encoder_hn)
+            decoder_outputs[t] = log_probs
+            decoder_input = outputs[:, t] if teacher_force else log_probs.argmax(dim=-1)
+        return decoder_outputs
+
+
+class EncoderDecoderGRUWithAttention(BaseModelClass):
+    def __init__(self, input_lang, output_lang, num_layers=1, bidirectional=False,
+                 hidden_size=data_hyperparameters.HIDDEN_SIZE,
+                 embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION,
+                 embedding_dropout=data_hyperparameters.EMBEDDING_DROPOUT,
+                 inter_recurrent_layer_dropout=data_hyperparameters.INTER_RECURRENT_LAYER_DROPOUT,
+                 intra_recurrent_layer_dropout=data_hyperparameters.INTRA_RECURRENT_LAYER_DROPOUT, use_packing=True,
+                 name='GRUWithAttention'):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.use_packing = use_packing
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.embedding_dimension = embedding_dimension
+        self.input_language_name = input_lang.name
+        self.output_lang_name = output_lang.name
+        self.encoder = EncoderGRU(input_lang, num_layers, bidirectional, hidden_size, embedding_dimension,
+                                  embedding_dropout, inter_recurrent_layer_dropout, intra_recurrent_layer_dropout,
+                                  use_packing, name)
+        self.decoder = DecoderGRUWithAttention(output_lang, num_layers, bidirectional, hidden_size, embedding_dimension,
+                                               embedding_dropout, inter_recurrent_layer_dropout,
+                                               intra_recurrent_layer_dropout, name)
         self.name = name
         self.finish_setup()
 
@@ -297,7 +415,8 @@ class EncoderDecoderGRUWithContext(BaseModelClass):
 
 
 class EncoderLSTM(BaseModelClass):
-    def __init__(self, lang, num_layers, bidirectional, hidden_size, embedding_dimension, dropout, use_packing, name):
+    def __init__(self, lang, num_layers, bidirectional, hidden_size, embedding_dimension, embedding_dropout,
+                 inter_recurrent_layer_dropout, intra_recurrent_layer_dropout, use_packing, name):
         super().__init__()
         self.hidden_size = hidden_size
         self.bidirectional = bidirectional
@@ -307,9 +426,10 @@ class EncoderLSTM(BaseModelClass):
         self.vocab_size = lang.n_words
         self.embedding = torch.nn.Embedding(self.vocab_size, embedding_dimension,
                                             padding_idx=data_hyperparameters.PAD_TOKEN)
-        self.dropout = torch.nn.Dropout(p=dropout)
-        self.LSTM = torch.nn.LSTM(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size,
-                                  batch_first=True, dropout=dropout, bidirectional=bidirectional) if num_layers > 1 else torch.nn.LSTM(
+        self.dropout = torch.nn.Dropout(p=embedding_dropout)
+        self.LSTM = WeightDropLSTM(weight_dropout=intra_recurrent_layer_dropout, num_layers=num_layers,
+                                   input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True,
+                                   dropout=inter_recurrent_layer_dropout, bidirectional=bidirectional) if num_layers > 1 else WeightDropLSTM(weight_dropout=intra_recurrent_layer_dropout,
             num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True, bidirectional=bidirectional)
         self.language_name = lang.name
         self.name = name
@@ -328,7 +448,8 @@ class EncoderLSTM(BaseModelClass):
 
 
 class DecoderLSTM(BaseModelClass):
-    def __init__(self, lang, num_layers, bidirectional, hidden_size, embedding_dimension, dropout, name):
+    def __init__(self, lang, num_layers, bidirectional, hidden_size, embedding_dimension, embedding_dropout,
+                 inter_recurrent_layer_dropout, intra_recurrent_layer_dropout, name):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
@@ -337,9 +458,10 @@ class DecoderLSTM(BaseModelClass):
         self.vocab_size = lang.n_words
         self.embedding = torch.nn.Embedding(self.vocab_size, embedding_dimension,
                                             padding_idx=data_hyperparameters.PAD_TOKEN)
-        self.dropout = torch.nn.Dropout(p=dropout)
-        self.LSTM = torch.nn.LSTM(num_layers=num_layers, input_size=embedding_dimension, hidden_size=2 * hidden_size if bidirectional else hidden_size,
-                                  batch_first=True, dropout=dropout) if num_layers > 1 else torch.nn.LSTM(
+        self.dropout = torch.nn.Dropout(p=embedding_dropout)
+        self.LSTM = WeightDropLSTM(weight_dropout=intra_recurrent_layer_dropout, num_layers=num_layers,
+                                   input_size=embedding_dimension, hidden_size=2 * hidden_size if bidirectional else hidden_size,
+                                   batch_first=True, dropout=inter_recurrent_layer_dropout) if num_layers > 1 else WeightDropLSTM(weight_dropout=intra_recurrent_layer_dropout,
             num_layers=num_layers, input_size=embedding_dimension, hidden_size=2 * hidden_size if bidirectional else hidden_size, batch_first=True)
         self.language_name = lang.name
         self.name = name
@@ -355,8 +477,9 @@ class DecoderLSTM(BaseModelClass):
                                                dim=-1), lstm_output, lstm_hn, lstm_cn
 
 
-class DecoderLSTMWithContext(BaseModelClass):
-    def __init__(self, lang, bidirectional, hidden_size, embedding_dimension, dropout, name):
+class DecoderLSTMWithContext(BaseModelClass): # todo: make work with multiple layers
+    def __init__(self, lang, bidirectional, hidden_size, embedding_dimension, embedding_dropout,
+                 inter_recurrent_layer_dropout, intra_recurrent_layer_dropout, name):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_layers = 1
@@ -365,9 +488,10 @@ class DecoderLSTMWithContext(BaseModelClass):
         self.vocab_size = lang.n_words
         self.embedding = torch.nn.Embedding(self.vocab_size, embedding_dimension,
                                             padding_idx=data_hyperparameters.PAD_TOKEN)
-        self.dropout = torch.nn.Dropout(p=dropout)
-        self.LSTM = torch.nn.LSTM(num_layers=1, input_size=embedding_dimension + 2 * hidden_size if bidirectional else embedding_dimension + hidden_size,
-                                  hidden_size=2 * hidden_size if bidirectional else hidden_size, batch_first=True)
+        self.dropout = torch.nn.Dropout(p=embedding_dropout)
+        self.LSTM = WeightDropLSTM(weight_dropout=intra_recurrent_layer_dropout, num_layers=1,
+                                   input_size=embedding_dimension + 2 * hidden_size if bidirectional else embedding_dimension + hidden_size,
+                                   hidden_size=2 * hidden_size if bidirectional else hidden_size, batch_first=True)
         self.language_name = lang.name
         self.name = name
         self.linear = torch.nn.Linear(4 * hidden_size + embedding_dimension if bidirectional else 2 * hidden_size + embedding_dimension,
@@ -385,10 +509,38 @@ class DecoderLSTMWithContext(BaseModelClass):
                                                dim=-1), lstm_output, lstm_hn, lstm_cn
 
 
+class DecoderLSTMWithAttention(BaseModelClass):
+    def __init__(self, lang, num_layers, bidirectional, hidden_size, embedding_dimension, embedding_dropout,
+                 inter_recurrent_layer_dropout, intra_recurrent_layer_dropout, name):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.embedding_dimension = embedding_dimension
+        self.vocab_size = lang.n_words
+        self.embedding = torch.nn.Embedding(self.vocab_size, embedding_dimension,
+                                            padding_idx=data_hyperparameters.PAD_TOKEN)
+        self.dropout = torch.nn.Dropout(p=embedding_dropout)
+        self.LSTM = WeightDropLSTM(weight_dropout=intra_recurrent_layer_dropout, num_layers=num_layers,
+                                   input_size=embedding_dimension, hidden_size=2 * hidden_size if bidirectional else hidden_size,
+                                   batch_first=True, dropout=inter_recurrent_layer_dropout) if num_layers > 1 else WeightDropLSTM(weight_dropout=intra_recurrent_layer_dropout,
+            num_layers=num_layers, input_size=embedding_dimension, hidden_size=2 * hidden_size if bidirectional else hidden_size, batch_first=True)
+        self.language_name = lang.name
+        self.name = name
+        self.linear = torch.nn.Linear(2 * hidden_size if bidirectional else hidden_size, lang.n_words)
+        self.finish_setup()
+
+    def forward(self):
+        pass
+
+
 class EncoderDecoderLSTM(BaseModelClass):
     def __init__(self, input_lang, output_lang, num_layers=1, bidirectional=False,
                  hidden_size=data_hyperparameters.HIDDEN_SIZE,
-                 embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION, dropout=data_hyperparameters.DROPOUT,
+                 embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION,
+                 embedding_dropout=data_hyperparameters.EMBEDDING_DROPOUT,
+                 inter_recurrent_layer_dropout=data_hyperparameters.INTER_RECURRENT_LAYER_DROPOUT,
+                 intra_recurrent_layer_dropout=data_hyperparameters.INTRA_RECURRENT_LAYER_DROPOUT,
                  use_packing=True, name='LSTM'):
         super().__init__()
         self.hidden_size = hidden_size
@@ -398,9 +550,11 @@ class EncoderDecoderLSTM(BaseModelClass):
         self.embedding_dimension = embedding_dimension
         self.input_language_name = input_lang.name
         self.output_lang_name = output_lang.name
-        self.encoder = EncoderLSTM(input_lang, num_layers, bidirectional, hidden_size, embedding_dimension, dropout,
+        self.encoder = EncoderLSTM(input_lang, num_layers, bidirectional, hidden_size, embedding_dimension,
+                                   embedding_dropout, inter_recurrent_layer_dropout, intra_recurrent_layer_dropout,
                                    use_packing, name)
-        self.decoder = DecoderLSTM(output_lang, num_layers, bidirectional, hidden_size, embedding_dimension, dropout,
+        self.decoder = DecoderLSTM(output_lang, num_layers, bidirectional, hidden_size, embedding_dimension,
+                                   embedding_dropout, inter_recurrent_layer_dropout, intra_recurrent_layer_dropout,
                                    name)
         self.name = name
         self.finish_setup()
@@ -422,8 +576,11 @@ class EncoderDecoderLSTM(BaseModelClass):
 
 class EncoderDecoderLSTMWithContext(BaseModelClass):
     def __init__(self, input_lang, output_lang, bidirectional=False, hidden_size=data_hyperparameters.HIDDEN_SIZE,
-                 embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION, dropout=data_hyperparameters.DROPOUT,
-                 use_packing=True, name='LSTM'):
+                 embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION,
+                 embedding_dropout=data_hyperparameters.EMBEDDING_DROPOUT,
+                 inter_recurrent_layer_dropout=data_hyperparameters.INTER_RECURRENT_LAYER_DROPOUT,
+                 intra_recurrent_layer_dropout=data_hyperparameters.INTRA_RECURRENT_LAYER_DROPOUT, use_packing=True,
+                 name='LSTMWithContext'):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_layers = 1
@@ -432,10 +589,51 @@ class EncoderDecoderLSTMWithContext(BaseModelClass):
         self.embedding_dimension = embedding_dimension
         self.input_language_name = input_lang.name
         self.output_lang_name = output_lang.name
-        self.encoder = EncoderLSTM(input_lang, 1, bidirectional, hidden_size, embedding_dimension, dropout, use_packing,
-                                   name)
-        self.decoder = DecoderLSTMWithContext(output_lang, bidirectional, hidden_size, embedding_dimension, dropout,
-                                              name)
+        self.encoder = EncoderLSTM(input_lang, 1, bidirectional, hidden_size, embedding_dimension, embedding_dropout,
+                                   inter_recurrent_layer_dropout, intra_recurrent_layer_dropout, use_packing, name)
+        self.decoder = DecoderLSTMWithContext(output_lang, bidirectional, hidden_size, embedding_dimension,
+                                              embedding_dropout, inter_recurrent_layer_dropout,
+                                              intra_recurrent_layer_dropout, name)
+        self.name = name
+        self.finish_setup()
+
+    def forward(self, inputs, outputs, teacher_force=False):
+        batch_size = outputs.shape[0]
+        output_length = outputs.shape[1]
+        encoder_output, encoder_hn, encoder_cn = self.encoder(inputs)
+        decoder_input = outputs[:, 0]
+        decoder_outputs = torch.zeros(output_length, batch_size, self.decoder.vocab_size,
+                                      device='cuda' if data_hyperparameters.USE_CUDA else 'cpu')
+        for t in range(1, output_length):
+            log_probs, decoder_output, decoder_hn, decoder_cn = self.decoder(decoder_input, encoder_output, encoder_hn,
+                                                                             encoder_cn)
+            decoder_outputs[t] = log_probs
+            decoder_input = outputs[:, t] if teacher_force else log_probs.argmax(dim=-1)
+        return decoder_outputs
+
+
+class EncoderDecoderLSTMWithAttention(BaseModelClass):
+    def __init__(self, input_lang, output_lang, num_layers=1, bidirectional=False,
+                 hidden_size=data_hyperparameters.HIDDEN_SIZE,
+                 embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION,
+                 embedding_dropout=data_hyperparameters.EMBEDDING_DROPOUT,
+                 inter_recurrent_layer_dropout=data_hyperparameters.INTER_RECURRENT_LAYER_DROPOUT,
+                 intra_recurrent_layer_dropout=data_hyperparameters.INTRA_RECURRENT_LAYER_DROPOUT, use_packing=True,
+                 name='LSTMWithAttention'):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.bidirectional = bidirectional
+        self.use_packing = use_packing
+        self.num_layers = num_layers
+        self.embedding_dimension = embedding_dimension
+        self.input_language_name = input_lang.name
+        self.output_lang_name = output_lang.name
+        self.encoder = EncoderLSTM(input_lang, num_layers, bidirectional, hidden_size, embedding_dimension,
+                                   embedding_dropout, inter_recurrent_layer_dropout, intra_recurrent_layer_dropout,
+                                   use_packing, name)
+        self.decoder = DecoderLSTMWithAttention(output_lang, num_layers, bidirectional, hidden_size,
+                                                embedding_dimension, embedding_dropout, inter_recurrent_layer_dropout,
+                                                intra_recurrent_layer_dropout, name)
         self.name = name
         self.finish_setup()
 
