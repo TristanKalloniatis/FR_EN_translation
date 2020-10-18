@@ -6,7 +6,6 @@ import matplotlib.pyplot as plt
 import datetime
 from math import nan, log
 
-
 if not os.path.exists('learning_curves/'):
     os.mkdir('learning_curves/')
 
@@ -27,19 +26,24 @@ def get_accuracy(loader, model, also_report_model_confidences=False):
                 yb = yb.cuda()
             model_output = model(xb, yb)
             yb_length = torch.sum(yb != data_hyperparameters.PAD_TOKEN, dim=-1)
-            packed_model_output_data = torch.nn.utils.rnn.pack_padded_sequence(model_output, yb_length, batch_first=True, enforce_sorted=False).data
-            packed_yb_data = torch.nn.utils.rnn.pack_padded_sequence(yb, yb_length, batch_first=True, enforce_sorted=False).data
+            packed_model_output_data = torch.nn.utils.rnn.pack_padded_sequence(model_output, yb_length,
+                                                                               batch_first=True,
+                                                                               enforce_sorted=False).data
+            packed_yb_data = torch.nn.utils.rnn.pack_padded_sequence(yb, yb_length, batch_first=True,
+                                                                     enforce_sorted=False).data
             accuracy += packed_model_output_data.argmax(dim=-1).eq(packed_yb_data).float().mean().item()
             if also_report_model_confidences:
                 log_probs, predictions = torch.max(packed_model_output_data, dim=-1)
                 probs = torch.exp(log_probs)
-                correct_predictions_mask = torch.where(predictions == packed_yb_data, torch.ones_like(packed_yb_data), torch.zeros_like(packed_yb_data))
+                correct_predictions_mask = torch.where(predictions == packed_yb_data, torch.ones_like(packed_yb_data),
+                                                       torch.zeros_like(packed_yb_data))
                 num_correct += torch.sum(correct_predictions_mask).item()
                 num_incorrect += torch.sum(1 - correct_predictions_mask).item()
                 correct_prediction_probs += torch.sum(correct_predictions_mask * probs).item()
                 incorrect_prediction_probs += torch.sum((1 - correct_predictions_mask) * probs).item()
     if also_report_model_confidences:
-        return accuracy / len(loader), correct_prediction_probs / num_correct, incorrect_prediction_probs / num_incorrect
+        return accuracy / len(
+            loader), correct_prediction_probs / num_correct, incorrect_prediction_probs / num_incorrect
     else:
         return accuracy / len(loader)
 
@@ -137,16 +141,22 @@ class BaseModelClass(torch.nn.Module, ABC):
 
 
 class EncoderGRU(BaseModelClass):
-    def __init__(self, lang, num_layers, hidden_size, embedding_dimension, dropout, use_packing, name):
+    def __init__(self, lang, num_layers, bidirectional, hidden_size, embedding_dimension, dropout, use_packing, name):
         super().__init__()
         self.hidden_size = hidden_size
         self.use_packing = use_packing
         self.num_layers = num_layers
+        self.bidirectional = bidirectional
         self.embedding_dimension = embedding_dimension
         self.vocab_size = lang.n_words
-        self.embedding = torch.nn.Embedding(self.vocab_size, embedding_dimension, padding_idx=data_hyperparameters.PAD_TOKEN)
+        self.embedding = torch.nn.Embedding(self.vocab_size, embedding_dimension,
+                                            padding_idx=data_hyperparameters.PAD_TOKEN)
         self.dropout = torch.nn.Dropout(p=dropout)
-        self.GRU = torch.nn.GRU(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True, dropout=dropout) if num_layers > 1 else torch.nn.GRU(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True)
+        self.GRU = torch.nn.GRU(num_layers=num_layers, bidirectional=bidirectional, input_size=embedding_dimension,
+                                hidden_size=hidden_size, batch_first=True,
+                                dropout=dropout) if num_layers > 1 else torch.nn.GRU(
+            num_layers=num_layers, bidirectional=bidirectional, input_size=embedding_dimension, hidden_size=hidden_size,
+            batch_first=True)
         self.language_name = lang.name
         self.name = name
         self.finish_setup()
@@ -160,51 +170,83 @@ class EncoderGRU(BaseModelClass):
         gru_output, gru_hn = self.GRU(embeds)
         if self.use_packing:
             gru_output, _ = torch.nn.utils.rnn.pad_packed_sequence(gru_output, batch_first=True)
+        # output = [batch, seq_len, num_directions * hidden_size]
+        # hn = [num_layers * num_directions, batch, hidden_size]
+        # h_n.view(num_layers, num_directions, batch, hidden_size)
         return gru_output, gru_hn
 
 
 class DecoderGRU(BaseModelClass):
-    def __init__(self, lang, num_layers, hidden_size, embedding_dimension, dropout, use_attention, name):
+    def __init__(self, lang, num_layers, bidirectional, hidden_size, embedding_dimension, dropout, name):
         super().__init__()
         self.hidden_size = hidden_size
+        self.bidirectional = bidirectional
         self.num_layers = num_layers
         self.embedding_dimension = embedding_dimension
         self.vocab_size = lang.n_words
         self.embedding = torch.nn.Embedding(self.vocab_size, embedding_dimension,
                                             padding_idx=data_hyperparameters.PAD_TOKEN)
         self.dropout = torch.nn.Dropout(p=dropout)
-        self.GRU = torch.nn.GRU(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size,
+        self.GRU = torch.nn.GRU(num_layers=num_layers, input_size=embedding_dimension,
+                                hidden_size=2 * hidden_size if bidirectional else hidden_size,
                                 batch_first=True, dropout=dropout) if num_layers > 1 else torch.nn.GRU(
-            num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True)
+            num_layers=num_layers, input_size=embedding_dimension,
+            hidden_size=2 * hidden_size if bidirectional else hidden_size, batch_first=True)
         self.language_name = lang.name
         self.name = name
-        self.use_attention = use_attention
-        if use_attention:
-            print('Attention not yet implemented')
-        self.linear = torch.nn.Linear(hidden_size, lang.n_words)
+        self.linear = torch.nn.Linear(2 * hidden_size if bidirectional else hidden_size, lang.n_words)
         self.finish_setup()
 
     def forward(self, inputs, encoder_output, encoder_hn):
         embeds = self.dropout(self.embedding(inputs.unsqueeze(1)))
-        gru_output, gru_hn = self.GRU(embeds, encoder_hn)
+        encoder_input = encoder_hn.view(self.num_layers, 2, -1, self.hidden_size).transpose(1, 2).reshape(self.num_layers, -1, 2 * self.hidden_size) if self.bidirectional else encoder_hn
+        gru_output, gru_hn = self.GRU(embeds, encoder_input)
         return torch.nn.functional.log_softmax(self.linear(gru_output.squeeze()), dim=-1), gru_output, gru_hn
 
 
+class DecoderGRUWithContext(BaseModelClass):
+    def __init__(self, lang, bidirectional, hidden_size, embedding_dimension, dropout, name):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = 1
+        self.bidirectional = bidirectional
+        self.embedding_dimension = embedding_dimension
+        self.vocab_size = lang.n_words
+        self.embedding = torch.nn.Embedding(self.vocab_size, embedding_dimension,
+                                            padding_idx=data_hyperparameters.PAD_TOKEN)
+        self.dropout = torch.nn.Dropout(p=dropout)
+        self.GRU = torch.nn.GRU(num_layers=1, input_size=embedding_dimension + 2 * hidden_size if bidirectional else embedding_dimension + hidden_size,
+                                hidden_size=2 * hidden_size if bidirectional else hidden_size, batch_first=True)
+        self.language_name = lang.name
+        self.name = name
+        self.linear = torch.nn.Linear(4 * hidden_size + embedding_dimension if bidirectional else 2 * hidden_size + embedding_dimension,
+                                      lang.n_words)
+        self.finish_setup()
+
+    def forward(self, inputs, encoder_output, encoder_hn):
+        embeds = self.dropout(self.embedding(inputs.unsqueeze(1)))
+        encoder_input = encoder_hn.view(self.num_layers, 2, -1, self.hidden_size).transpose(1, 2).reshape(self.num_layers, -1, 2 * self.hidden_size) if self.bidirectional else encoder_hn
+        embeds_with_context = torch.cat([embeds, encoder_input.transpose(0, 1)], dim=-1)
+        gru_output, gru_hn = self.GRU(embeds_with_context, encoder_input)
+        output_with_embeds_and_context = torch.cat([embeds_with_context.squeeze(1), gru_output.squeeze(1)], dim=-1)
+        return torch.nn.functional.log_softmax(self.linear(output_with_embeds_and_context), dim=-1), gru_output, gru_hn
+
+
 class EncoderDecoderGRU(BaseModelClass):
-    def __init__(self, input_lang, output_lang, num_layers=1, hidden_size=data_hyperparameters.HIDDEN_SIZE,
+    def __init__(self, input_lang, output_lang, num_layers=1, bidirectional=False,
+                 hidden_size=data_hyperparameters.HIDDEN_SIZE,
                  embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION, dropout=data_hyperparameters.DROPOUT,
-                 use_packing=True, use_attention=False, name='GRU'):
+                 use_packing=True, name='GRU'):
         super().__init__()
         self.hidden_size = hidden_size
         self.use_packing = use_packing
-        self.use_attention = use_attention
         self.num_layers = num_layers
+        self.bidirectional = bidirectional
         self.embedding_dimension = embedding_dimension
         self.input_language_name = input_lang.name
         self.output_lang_name = output_lang.name
-        self.encoder = EncoderGRU(input_lang, num_layers, hidden_size, embedding_dimension, dropout, use_packing, name)
-        self.decoder = DecoderGRU(output_lang, num_layers, hidden_size, embedding_dimension, dropout, use_attention,
-                                  name)
+        self.encoder = EncoderGRU(input_lang, num_layers, bidirectional, hidden_size, embedding_dimension, dropout, use_packing, name)
+        self.decoder = DecoderGRU(output_lang, num_layers, bidirectional, hidden_size, embedding_dimension, dropout, name)
         self.name = name
         self.finish_setup()
 
@@ -213,7 +255,40 @@ class EncoderDecoderGRU(BaseModelClass):
         output_length = outputs.shape[1]
         encoder_output, encoder_hn = self.encoder(inputs)
         decoder_input = outputs[:, 0]
-        decoder_outputs = torch.zeros(output_length, batch_size, self.decoder.vocab_size, device='cuda' if data_hyperparameters.USE_CUDA else 'cpu')
+        decoder_outputs = torch.zeros(output_length, batch_size, self.decoder.vocab_size,
+                                      device='cuda' if data_hyperparameters.USE_CUDA else 'cpu')
+        for t in range(1, output_length):
+            log_probs, decoder_output, decoder_hn = self.decoder(decoder_input, encoder_output, encoder_hn)
+            decoder_outputs[t] = log_probs
+            decoder_input = outputs[:, t] if teacher_force else log_probs.argmax(dim=-1)
+        return decoder_outputs
+
+
+class EncoderDecoderGRUWithContext(BaseModelClass):
+    def __init__(self, input_lang, output_lang, bidirectional=False, hidden_size=data_hyperparameters.HIDDEN_SIZE,
+                 embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION, dropout=data_hyperparameters.DROPOUT,
+                 use_packing=True, name='GRU'):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.bidirectional = bidirectional
+        self.use_packing = use_packing
+        self.embedding_dimension = embedding_dimension
+        self.input_language_name = input_lang.name
+        self.output_lang_name = output_lang.name
+        self.encoder = EncoderGRU(input_lang, 1, bidirectional, hidden_size, embedding_dimension, dropout, use_packing,
+                                  name)
+        self.decoder = DecoderGRUWithContext(output_lang, bidirectional, hidden_size, embedding_dimension, dropout,
+                                             name)
+        self.name = name
+        self.finish_setup()
+
+    def forward(self, inputs, outputs, teacher_force=False):
+        batch_size = outputs.shape[0]
+        output_length = outputs.shape[1]
+        encoder_output, encoder_hn = self.encoder(inputs)
+        decoder_input = outputs[:, 0]
+        decoder_outputs = torch.zeros(output_length, batch_size, self.decoder.vocab_size,
+                                      device='cuda' if data_hyperparameters.USE_CUDA else 'cpu')
         for t in range(1, output_length):
             log_probs, decoder_output, decoder_hn = self.decoder(decoder_input, encoder_output, encoder_hn)
             decoder_outputs[t] = log_probs
@@ -222,16 +297,20 @@ class EncoderDecoderGRU(BaseModelClass):
 
 
 class EncoderLSTM(BaseModelClass):
-    def __init__(self, lang, num_layers, hidden_size, embedding_dimension, dropout, use_packing, name):
+    def __init__(self, lang, num_layers, bidirectional, hidden_size, embedding_dimension, dropout, use_packing, name):
         super().__init__()
         self.hidden_size = hidden_size
+        self.bidirectional = bidirectional
         self.use_packing = use_packing
         self.num_layers = num_layers
         self.embedding_dimension = embedding_dimension
         self.vocab_size = lang.n_words
-        self.embedding = torch.nn.Embedding(self.vocab_size, embedding_dimension, padding_idx=data_hyperparameters.PAD_TOKEN)
+        self.embedding = torch.nn.Embedding(self.vocab_size, embedding_dimension,
+                                            padding_idx=data_hyperparameters.PAD_TOKEN)
         self.dropout = torch.nn.Dropout(p=dropout)
-        self.LSTM = torch.nn.LSTM(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True, dropout=dropout) if num_layers > 1 else torch.nn.LSTM(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True)
+        self.LSTM = torch.nn.LSTM(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size,
+                                  batch_first=True, dropout=dropout, bidirectional=bidirectional) if num_layers > 1 else torch.nn.LSTM(
+            num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True, bidirectional=bidirectional)
         self.language_name = lang.name
         self.name = name
         self.finish_setup()
@@ -249,46 +328,79 @@ class EncoderLSTM(BaseModelClass):
 
 
 class DecoderLSTM(BaseModelClass):
-    def __init__(self, lang, num_layers, hidden_size, embedding_dimension, dropout, use_attention, name):
+    def __init__(self, lang, num_layers, bidirectional, hidden_size, embedding_dimension, dropout, name):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
+        self.bidirectional = bidirectional
         self.embedding_dimension = embedding_dimension
         self.vocab_size = lang.n_words
         self.embedding = torch.nn.Embedding(self.vocab_size, embedding_dimension,
                                             padding_idx=data_hyperparameters.PAD_TOKEN)
         self.dropout = torch.nn.Dropout(p=dropout)
-        self.LSTM = torch.nn.LSTM(num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size,
+        self.LSTM = torch.nn.LSTM(num_layers=num_layers, input_size=embedding_dimension, hidden_size=2 * hidden_size if bidirectional else hidden_size,
                                   batch_first=True, dropout=dropout) if num_layers > 1 else torch.nn.LSTM(
-            num_layers=num_layers, input_size=embedding_dimension, hidden_size=hidden_size, batch_first=True)
+            num_layers=num_layers, input_size=embedding_dimension, hidden_size=2 * hidden_size if bidirectional else hidden_size, batch_first=True)
         self.language_name = lang.name
         self.name = name
-        self.use_attention = use_attention
-        if use_attention:
-            print('Attention not yet implemented')
-        self.linear = torch.nn.Linear(hidden_size, lang.n_words)
+        self.linear = torch.nn.Linear(2 * hidden_size if bidirectional else hidden_size, lang.n_words)
         self.finish_setup()
 
-    def forward(self, inputs, encoder_output, encoder_hn):
+    def forward(self, inputs, encoder_output, encoder_hn, encoder_cn):
         embeds = self.dropout(self.embedding(inputs.unsqueeze(1)))
-        lstm_output, (lstm_hn, lstm_cn) = self.LSTM(embeds, encoder_hn)
-        return torch.nn.functional.log_softmax(self.linear(lstm_output.squeeze()), dim=-1), lstm_output, lstm_hn, lstm_cn
+        encoder_input_hn = encoder_hn.view(self.num_layers, 2, -1, self.hidden_size).transpose(1, 2).reshape(self.num_layers, -1, 2 * self.hidden_size) if self.bidirectional else encoder_hn
+        encoder_input_cn = encoder_cn.view(self.num_layers, 2, -1, self.hidden_size).transpose(1, 2).reshape(self.num_layers, -1, 2 * self.hidden_size) if self.bidirectional else encoder_cn
+        lstm_output, (lstm_hn, lstm_cn) = self.LSTM(embeds, (encoder_input_hn, encoder_input_cn))
+        return torch.nn.functional.log_softmax(self.linear(lstm_output.squeeze()),
+                                               dim=-1), lstm_output, lstm_hn, lstm_cn
+
+
+class DecoderLSTMWithContext(BaseModelClass):
+    def __init__(self, lang, bidirectional, hidden_size, embedding_dimension, dropout, name):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = 1
+        self.bidirectional = bidirectional
+        self.embedding_dimension = embedding_dimension
+        self.vocab_size = lang.n_words
+        self.embedding = torch.nn.Embedding(self.vocab_size, embedding_dimension,
+                                            padding_idx=data_hyperparameters.PAD_TOKEN)
+        self.dropout = torch.nn.Dropout(p=dropout)
+        self.LSTM = torch.nn.LSTM(num_layers=1, input_size=embedding_dimension + 2 * hidden_size if bidirectional else embedding_dimension + hidden_size,
+                                  hidden_size=2 * hidden_size if bidirectional else hidden_size, batch_first=True)
+        self.language_name = lang.name
+        self.name = name
+        self.linear = torch.nn.Linear(4 * hidden_size + embedding_dimension if bidirectional else 2 * hidden_size + embedding_dimension,
+                                      lang.n_words)
+        self.finish_setup()
+
+    def forward(self, inputs, encoder_output, encoder_hn, encoder_cn):
+        embeds = self.dropout(self.embedding(inputs.unsqueeze(1)))
+        encoder_input_hn = encoder_hn.view(self.num_layers, 2, -1, self.hidden_size).transpose(1, 2).reshape(self.num_layers, -1, 2 * self.hidden_size) if self.bidirectional else encoder_hn
+        encoder_input_cn = encoder_cn.view(self.num_layers, 2, -1, self.hidden_size).transpose(1, 2).reshape(self.num_layers, -1, 2 * self.hidden_size) if self.bidirectional else encoder_cn
+        embeds_with_context = torch.cat([embeds, encoder_input_hn.transpose(0, 1)], dim=-1)
+        lstm_output, (lstm_hn, lstm_cn) = self.LSTM(embeds_with_context, (encoder_input_hn, encoder_input_cn))
+        output_with_embeds_and_context = torch.cat([embeds_with_context.squeeze(1), lstm_output.squeeze(1)], dim=-1)
+        return torch.nn.functional.log_softmax(self.linear(output_with_embeds_and_context),
+                                               dim=-1), lstm_output, lstm_hn, lstm_cn
 
 
 class EncoderDecoderLSTM(BaseModelClass):
-    def __init__(self, input_lang, output_lang, num_layers=1, hidden_size=data_hyperparameters.HIDDEN_SIZE,
+    def __init__(self, input_lang, output_lang, num_layers=1, bidirectional=False,
+                 hidden_size=data_hyperparameters.HIDDEN_SIZE,
                  embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION, dropout=data_hyperparameters.DROPOUT,
-                 use_packing=True, use_attention=False, name='LSTM'):
+                 use_packing=True, name='LSTM'):
         super().__init__()
         self.hidden_size = hidden_size
+        self.bidirectional = bidirectional
         self.use_packing = use_packing
-        self.use_attention = use_attention
         self.num_layers = num_layers
         self.embedding_dimension = embedding_dimension
         self.input_language_name = input_lang.name
         self.output_lang_name = output_lang.name
-        self.encoder = EncoderLSTM(input_lang, num_layers, hidden_size, embedding_dimension, dropout, use_packing, name)
-        self.decoder = DecoderLSTM(output_lang, num_layers, hidden_size, embedding_dimension, dropout, use_attention,
+        self.encoder = EncoderLSTM(input_lang, num_layers, bidirectional, hidden_size, embedding_dimension, dropout,
+                                   use_packing, name)
+        self.decoder = DecoderLSTM(output_lang, num_layers, bidirectional, hidden_size, embedding_dimension, dropout,
                                    name)
         self.name = name
         self.finish_setup()
@@ -298,9 +410,45 @@ class EncoderDecoderLSTM(BaseModelClass):
         output_length = outputs.shape[1]
         encoder_output, encoder_hn, encoder_cn = self.encoder(inputs)
         decoder_input = outputs[:, 0]
-        decoder_outputs = torch.zeros(output_length, batch_size, self.decoder.vocab_size, device='cuda' if data_hyperparameters.USE_CUDA else 'cpu')
+        decoder_outputs = torch.zeros(output_length, batch_size, self.decoder.vocab_size,
+                                      device='cuda' if data_hyperparameters.USE_CUDA else 'cpu')
         for t in range(1, output_length):
-            log_probs, decoder_output, decoder_hn, decoder_cn = self.decoder(decoder_input, encoder_output, encoder_hn, encoder_cn)
+            log_probs, decoder_output, decoder_hn, decoder_cn = self.decoder(decoder_input, encoder_output, encoder_hn,
+                                                                             encoder_cn)
+            decoder_outputs[t] = log_probs
+            decoder_input = outputs[:, t] if teacher_force else log_probs.argmax(dim=-1)
+        return decoder_outputs
+
+
+class EncoderDecoderLSTMWithContext(BaseModelClass):
+    def __init__(self, input_lang, output_lang, bidirectional=False, hidden_size=data_hyperparameters.HIDDEN_SIZE,
+                 embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION, dropout=data_hyperparameters.DROPOUT,
+                 use_packing=True, name='LSTM'):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = 1
+        self.bidirectional = bidirectional
+        self.use_packing = use_packing
+        self.embedding_dimension = embedding_dimension
+        self.input_language_name = input_lang.name
+        self.output_lang_name = output_lang.name
+        self.encoder = EncoderLSTM(input_lang, 1, bidirectional, hidden_size, embedding_dimension, dropout, use_packing,
+                                   name)
+        self.decoder = DecoderLSTMWithContext(output_lang, bidirectional, hidden_size, embedding_dimension, dropout,
+                                              name)
+        self.name = name
+        self.finish_setup()
+
+    def forward(self, inputs, outputs, teacher_force=False):
+        batch_size = outputs.shape[0]
+        output_length = outputs.shape[1]
+        encoder_output, encoder_hn, encoder_cn = self.encoder(inputs)
+        decoder_input = outputs[:, 0]
+        decoder_outputs = torch.zeros(output_length, batch_size, self.decoder.vocab_size,
+                                      device='cuda' if data_hyperparameters.USE_CUDA else 'cpu')
+        for t in range(1, output_length):
+            log_probs, decoder_output, decoder_hn, decoder_cn = self.decoder(decoder_input, encoder_output, encoder_hn,
+                                                                             encoder_cn)
             decoder_outputs[t] = log_probs
             decoder_input = outputs[:, t] if teacher_force else log_probs.argmax(dim=-1)
         return decoder_outputs
