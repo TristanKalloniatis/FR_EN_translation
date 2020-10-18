@@ -284,7 +284,7 @@ class DecoderGRUWithContext(BaseModelClass): # todo: make this work with multipl
         return torch.nn.functional.log_softmax(self.linear(output_with_embeds_and_context), dim=-1), gru_output, gru_hn
 
 
-class DecoderGRUWithAttention(BaseModelClass):
+class DecoderGRUWithDotProductAttention(BaseModelClass): # todo: make work when num_layers > 1
     def __init__(self, lang, num_layers, bidirectional, hidden_size, embedding_dimension, embedding_dropout,
                  inter_recurrent_layer_dropout, intra_recurrent_layer_dropout, name):
         super().__init__()
@@ -307,8 +307,51 @@ class DecoderGRUWithAttention(BaseModelClass):
         self.linear = torch.nn.Linear(2 * hidden_size if bidirectional else hidden_size, lang.n_words)
         self.finish_setup()
 
-    def forward(self):
+    def forward(self, inputs, encoder_output, encoder_hn):
         pass
+        # todo: finish this
+        embeds = self.dropout(self.embedding(inputs.unsqueeze(1)))
+        encoder_input = encoder_hn.view(self.num_layers, 2, -1, self.hidden_size).transpose(1, 2).reshape(self.num_layers, -1, 2 * self.hidden_size) if self.bidirectional else encoder_hn
+        similarity_scores = torch.bmm(encoder_output, )
+        embeds_with_context = torch.cat([embeds, encoder_input.transpose(0, 1)], dim=-1)
+        gru_output, gru_hn = self.GRU(embeds_with_context, encoder_input)
+        output_with_embeds_and_context = torch.cat([embeds_with_context.squeeze(1), gru_output.squeeze(1)], dim=-1)
+        return torch.nn.functional.log_softmax(self.linear(output_with_embeds_and_context), dim=-1), gru_output, gru_hn
+
+
+class DecoderGRUWithLearnableAttention(BaseModelClass): # todo: make work when num_layers > 1
+    def __init__(self, lang, num_layers, bidirectional, hidden_size, embedding_dimension, embedding_dropout,
+                 inter_recurrent_layer_dropout, intra_recurrent_layer_dropout, name):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.bidirectional = bidirectional
+        self.num_layers = num_layers
+        self.embedding_dimension = embedding_dimension
+        self.vocab_size = lang.n_words
+        self.embedding = torch.nn.Embedding(self.vocab_size, embedding_dimension,
+                                            padding_idx=data_hyperparameters.PAD_TOKEN)
+        self.dropout = torch.nn.Dropout(p=embedding_dropout)
+        self.GRU = WeightDropGRU(weight_dropout=intra_recurrent_layer_dropout, num_layers=num_layers,
+                                 input_size=embedding_dimension,
+                                 hidden_size=2 * hidden_size if bidirectional else hidden_size, batch_first=True,
+                                 dropout=inter_recurrent_layer_dropout) if num_layers > 1 else WeightDropGRU(weight_dropout=intra_recurrent_layer_dropout,
+            num_layers=num_layers, input_size=embedding_dimension,
+            hidden_size=2 * hidden_size if bidirectional else hidden_size, batch_first=True)
+        self.language_name = lang.name
+        self.name = name
+        self.linear = torch.nn.Linear(2 * hidden_size if bidirectional else hidden_size, lang.n_words)
+        self.finish_setup()
+
+    def forward(self, inputs, encoder_output, encoder_hn):
+        pass
+        # todo: finish this
+        embeds = self.dropout(self.embedding(inputs.unsqueeze(1)))
+        encoder_input = encoder_hn.view(self.num_layers, 2, -1, self.hidden_size).transpose(1, 2).reshape(self.num_layers, -1, 2 * self.hidden_size) if self.bidirectional else encoder_hn
+        similarity_scores = torch.bmm(encoder_output, )
+        embeds_with_context = torch.cat([embeds, encoder_input.transpose(0, 1)], dim=-1)
+        gru_output, gru_hn = self.GRU(embeds_with_context, encoder_input)
+        output_with_embeds_and_context = torch.cat([embeds_with_context.squeeze(1), gru_output.squeeze(1)], dim=-1)
+        return torch.nn.functional.log_softmax(self.linear(output_with_embeds_and_context), dim=-1), gru_output, gru_hn
 
 
 class EncoderDecoderGRU(BaseModelClass):
@@ -385,14 +428,14 @@ class EncoderDecoderGRUWithContext(BaseModelClass):
         return decoder_outputs
 
 
-class EncoderDecoderGRUWithAttention(BaseModelClass):
+class EncoderDecoderGRUWithDotProductAttention(BaseModelClass):
     def __init__(self, input_lang, output_lang, num_layers=1, bidirectional=False,
                  hidden_size=data_hyperparameters.HIDDEN_SIZE,
                  embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION,
                  embedding_dropout=data_hyperparameters.EMBEDDING_DROPOUT,
                  inter_recurrent_layer_dropout=data_hyperparameters.INTER_RECURRENT_LAYER_DROPOUT,
                  intra_recurrent_layer_dropout=data_hyperparameters.INTRA_RECURRENT_LAYER_DROPOUT, use_packing=True,
-                 name='GRUWithAttention'):
+                 name='GRUWithDotProductAttention'):
         super().__init__()
         self.hidden_size = hidden_size
         self.use_packing = use_packing
@@ -404,9 +447,50 @@ class EncoderDecoderGRUWithAttention(BaseModelClass):
         self.encoder = EncoderGRU(input_lang, num_layers, bidirectional, hidden_size, embedding_dimension,
                                   embedding_dropout, inter_recurrent_layer_dropout, intra_recurrent_layer_dropout,
                                   use_packing, name)
-        self.decoder = DecoderGRUWithAttention(output_lang, num_layers, bidirectional, hidden_size, embedding_dimension,
-                                               embedding_dropout, inter_recurrent_layer_dropout,
-                                               intra_recurrent_layer_dropout, name)
+        self.decoder = DecoderGRUWithDotProductAttention(output_lang, num_layers, bidirectional, hidden_size,
+                                                         embedding_dimension, embedding_dropout,
+                                                         inter_recurrent_layer_dropout, intra_recurrent_layer_dropout,
+                                                         name)
+        self.name = name
+        self.finish_setup()
+
+    def forward(self, inputs, outputs, teacher_force=False):
+        batch_size = outputs.shape[0]
+        output_length = outputs.shape[1]
+        encoder_output, encoder_hn = self.encoder(inputs)
+        decoder_input = outputs[:, 0]
+        decoder_outputs = torch.zeros(output_length, batch_size, self.decoder.vocab_size,
+                                      device='cuda' if data_hyperparameters.USE_CUDA else 'cpu')
+        for t in range(1, output_length):
+            log_probs, decoder_output, decoder_hn = self.decoder(decoder_input, encoder_output, encoder_hn)
+            decoder_outputs[t] = log_probs
+            decoder_input = outputs[:, t] if teacher_force else log_probs.argmax(dim=-1)
+        return decoder_outputs
+
+
+class EncoderDecoderGRUWithLearnableAttention(BaseModelClass):
+    def __init__(self, input_lang, output_lang, num_layers=1, bidirectional=False,
+                 hidden_size=data_hyperparameters.HIDDEN_SIZE,
+                 embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION,
+                 embedding_dropout=data_hyperparameters.EMBEDDING_DROPOUT,
+                 inter_recurrent_layer_dropout=data_hyperparameters.INTER_RECURRENT_LAYER_DROPOUT,
+                 intra_recurrent_layer_dropout=data_hyperparameters.INTRA_RECURRENT_LAYER_DROPOUT, use_packing=True,
+                 name='GRUWithLearnableAttention'):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.use_packing = use_packing
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.embedding_dimension = embedding_dimension
+        self.input_language_name = input_lang.name
+        self.output_lang_name = output_lang.name
+        self.encoder = EncoderGRU(input_lang, num_layers, bidirectional, hidden_size, embedding_dimension,
+                                  embedding_dropout, inter_recurrent_layer_dropout, intra_recurrent_layer_dropout,
+                                  use_packing, name)
+        self.decoder = DecoderGRUWithDotProductAttention(output_lang, num_layers, bidirectional, hidden_size,
+                                                         embedding_dimension, embedding_dropout,
+                                                         inter_recurrent_layer_dropout, intra_recurrent_layer_dropout,
+                                                         name)
         self.name = name
         self.finish_setup()
 
@@ -519,7 +603,7 @@ class DecoderLSTMWithContext(BaseModelClass): # todo: make work with multiple la
                                                dim=-1), lstm_output, lstm_hn, lstm_cn
 
 
-class DecoderLSTMWithAttention(BaseModelClass):
+class DecoderLSTMWithDotProductAttention(BaseModelClass): # todo: make work when num_layers > 1
     def __init__(self, lang, num_layers, bidirectional, hidden_size, embedding_dimension, embedding_dropout,
                  inter_recurrent_layer_dropout, intra_recurrent_layer_dropout, name):
         super().__init__()
@@ -541,6 +625,33 @@ class DecoderLSTMWithAttention(BaseModelClass):
         self.finish_setup()
 
     def forward(self):
+        # todo: finish this
+        pass
+
+
+class DecoderLSTMWithLearnableAttention(BaseModelClass): # todo: make work when num_layers > 1
+    def __init__(self, lang, num_layers, bidirectional, hidden_size, embedding_dimension, embedding_dropout,
+                 inter_recurrent_layer_dropout, intra_recurrent_layer_dropout, name):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.embedding_dimension = embedding_dimension
+        self.vocab_size = lang.n_words
+        self.embedding = torch.nn.Embedding(self.vocab_size, embedding_dimension,
+                                            padding_idx=data_hyperparameters.PAD_TOKEN)
+        self.dropout = torch.nn.Dropout(p=embedding_dropout)
+        self.LSTM = WeightDropLSTM(weight_dropout=intra_recurrent_layer_dropout, num_layers=num_layers,
+                                   input_size=embedding_dimension, hidden_size=2 * hidden_size if bidirectional else hidden_size,
+                                   batch_first=True, dropout=inter_recurrent_layer_dropout) if num_layers > 1 else WeightDropLSTM(weight_dropout=intra_recurrent_layer_dropout,
+            num_layers=num_layers, input_size=embedding_dimension, hidden_size=2 * hidden_size if bidirectional else hidden_size, batch_first=True)
+        self.language_name = lang.name
+        self.name = name
+        self.linear = torch.nn.Linear(2 * hidden_size if bidirectional else hidden_size, lang.n_words)
+        self.finish_setup()
+
+    def forward(self):
+        # todo: finish this
         pass
 
 
@@ -622,14 +733,14 @@ class EncoderDecoderLSTMWithContext(BaseModelClass):
         return decoder_outputs
 
 
-class EncoderDecoderLSTMWithAttention(BaseModelClass):
+class EncoderDecoderLSTMWithDotProductAttention(BaseModelClass):
     def __init__(self, input_lang, output_lang, num_layers=1, bidirectional=False,
                  hidden_size=data_hyperparameters.HIDDEN_SIZE,
                  embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION,
                  embedding_dropout=data_hyperparameters.EMBEDDING_DROPOUT,
                  inter_recurrent_layer_dropout=data_hyperparameters.INTER_RECURRENT_LAYER_DROPOUT,
                  intra_recurrent_layer_dropout=data_hyperparameters.INTRA_RECURRENT_LAYER_DROPOUT, use_packing=True,
-                 name='LSTMWithAttention'):
+                 name='LSTMWithDotProductAttention'):
         super().__init__()
         self.hidden_size = hidden_size
         self.bidirectional = bidirectional
@@ -641,9 +752,51 @@ class EncoderDecoderLSTMWithAttention(BaseModelClass):
         self.encoder = EncoderLSTM(input_lang, num_layers, bidirectional, hidden_size, embedding_dimension,
                                    embedding_dropout, inter_recurrent_layer_dropout, intra_recurrent_layer_dropout,
                                    use_packing, name)
-        self.decoder = DecoderLSTMWithAttention(output_lang, num_layers, bidirectional, hidden_size,
-                                                embedding_dimension, embedding_dropout, inter_recurrent_layer_dropout,
-                                                intra_recurrent_layer_dropout, name)
+        self.decoder = DecoderLSTMWithDotProductAttention(output_lang, num_layers, bidirectional, hidden_size,
+                                                          embedding_dimension, embedding_dropout,
+                                                          inter_recurrent_layer_dropout, intra_recurrent_layer_dropout,
+                                                          name)
+        self.name = name
+        self.finish_setup()
+
+    def forward(self, inputs, outputs, teacher_force=False):
+        batch_size = outputs.shape[0]
+        output_length = outputs.shape[1]
+        encoder_output, encoder_hn, encoder_cn = self.encoder(inputs)
+        decoder_input = outputs[:, 0]
+        decoder_outputs = torch.zeros(output_length, batch_size, self.decoder.vocab_size,
+                                      device='cuda' if data_hyperparameters.USE_CUDA else 'cpu')
+        for t in range(1, output_length):
+            log_probs, decoder_output, decoder_hn, decoder_cn = self.decoder(decoder_input, encoder_output, encoder_hn,
+                                                                             encoder_cn)
+            decoder_outputs[t] = log_probs
+            decoder_input = outputs[:, t] if teacher_force else log_probs.argmax(dim=-1)
+        return decoder_outputs
+
+
+class EncoderDecoderLSTMWithLearnableAttention(BaseModelClass):
+    def __init__(self, input_lang, output_lang, num_layers=1, bidirectional=False,
+                 hidden_size=data_hyperparameters.HIDDEN_SIZE,
+                 embedding_dimension=data_hyperparameters.EMBEDDING_DIMENSION,
+                 embedding_dropout=data_hyperparameters.EMBEDDING_DROPOUT,
+                 inter_recurrent_layer_dropout=data_hyperparameters.INTER_RECURRENT_LAYER_DROPOUT,
+                 intra_recurrent_layer_dropout=data_hyperparameters.INTRA_RECURRENT_LAYER_DROPOUT, use_packing=True,
+                 name='LSTMWithLearnableAttention'):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.bidirectional = bidirectional
+        self.use_packing = use_packing
+        self.num_layers = num_layers
+        self.embedding_dimension = embedding_dimension
+        self.input_language_name = input_lang.name
+        self.output_lang_name = output_lang.name
+        self.encoder = EncoderLSTM(input_lang, num_layers, bidirectional, hidden_size, embedding_dimension,
+                                   embedding_dropout, inter_recurrent_layer_dropout, intra_recurrent_layer_dropout,
+                                   use_packing, name)
+        self.decoder = DecoderLSTMWithDotProductAttention(output_lang, num_layers, bidirectional, hidden_size,
+                                                          embedding_dimension, embedding_dropout,
+                                                          inter_recurrent_layer_dropout, intra_recurrent_layer_dropout,
+                                                          name)
         self.name = name
         self.finish_setup()
 
