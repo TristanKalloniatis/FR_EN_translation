@@ -11,6 +11,7 @@ if not os.path.exists('learning_curves/'):
 
 device = torch.device('cuda' if data_hyperparameters.USE_CUDA else 'cpu')
 
+LARGE_NEGATIVE = -1e9
 
 def get_accuracy(loader, model, also_report_model_confidences=False):
     if data_hyperparameters.USE_CUDA:
@@ -216,10 +217,11 @@ class DecoderGRU(BaseModelClass):
         self.decoder_type = 'vanilla'
         self.finish_setup()
 
-    def forward(self, inputs, encoder_output, encoder_hidden, decoder_output, decoder_hidden):
+    def forward(self, inputs, attention_mask, encoder_output, encoder_hidden, decoder_output, decoder_hidden):
         '''
         Pass through one stage of decoding
         :param inputs: Tensor of shape [B] (type long)
+        :param attention_mask: Tensor of shape [B, T] (type bool)
         :param encoder_output: Tensor of shape [B, T, H]
         :param encoder_hidden: Tensor of shape [L, B, H]
         :param decoder_output: Tensor of shape [B, S=1, H]
@@ -256,10 +258,11 @@ class DecoderGRUWithContext(BaseModelClass):
         self.decoder_type = 'context'
         self.finish_setup()
 
-    def forward(self, inputs, encoder_output, encoder_hidden, decoder_output, decoder_hidden):
+    def forward(self, inputs, attention_mask, encoder_output, encoder_hidden, decoder_output, decoder_hidden):
         '''
         Pass through one stage of decoding
         :param inputs: Tensor of shape [B] (type long)
+        :param attention_mask: Tensor of shape [B, T] (type bool)
         :param encoder_output: Tensor of shape [B, T, H]
         :param encoder_hidden: Tensor of shape [L, B, H]
         :param decoder_output: Tensor of shape [B, S=1, H]
@@ -297,10 +300,11 @@ class DecoderGRUWithDotProductAttention(BaseModelClass):
         self.decoder_type = 'dot_product_attention'
         self.finish_setup()
 
-    def forward(self, inputs, encoder_output, encoder_hidden, decoder_output, decoder_hidden):
+    def forward(self, inputs, attention_mask, encoder_output, encoder_hidden, decoder_output, decoder_hidden):
         '''
         Pass through one stage of decoding
         :param inputs: Tensor of shape [B] (type long)
+        :param attention_mask: Tensor of shape [B, T] (type bool)
         :param encoder_output: Tensor of shape [B, T, H]
         :param encoder_hidden: Tensor of shape [L, B, H]
         :param decoder_output: Tensor of shape [B, S=1, H]
@@ -312,6 +316,7 @@ class DecoderGRUWithDotProductAttention(BaseModelClass):
         '''
         embeds = self.embedding_dropout(self.embedding(inputs.unsqueeze(1))) # [B, 1, E]
         similarity_scores = torch.bmm(encoder_output, decoder_output.transpose(1, 2)) # [B, T, 1]
+        similarity_scores = similarity_scores.masked_fill(attention_mask.unsqueeze(2), LARGE_NEGATIVE) # [B, T, 1]
         attention_weights = torch.nn.functional.softmax(similarity_scores, dim=1).transpose(1, 2) # [B, 1, T]
         context = torch.bmm(attention_weights, encoder_output) # [B, 1, H]
         gru_output, gru_hidden = self.GRU(torch.cat([embeds, context], dim=2), decoder_hidden) # [B, S=1, H], [L, B, H]
@@ -342,10 +347,11 @@ class DecoderGRUWithLearnableAttention(BaseModelClass):
         self.decoder_type = 'learnable_attention'
         self.finish_setup()
 
-    def forward(self, inputs, encoder_output, encoder_hidden, decoder_output, decoder_hidden):
+    def forward(self, inputs, attention_mask, encoder_output, encoder_hidden, decoder_output, decoder_hidden):
         '''
         Pass through one stage of decoding
         :param inputs: Tensor of shape [B] (type long)
+        :param attention_mask: Tensor of shape [B, T] (type bool)
         :param encoder_output: Tensor of shape [B, T, H]
         :param encoder_hidden: Tensor of shape [L, B, H]
         :param decoder_output: Tensor of shape [B, S=1, H]
@@ -359,6 +365,7 @@ class DecoderGRUWithLearnableAttention(BaseModelClass):
         source_length = encoder_output.shape[1]
         attention_layer_1 = self.attention_layer_1(torch.cat([encoder_output, decoder_output.repeat(1, source_length, 1)], dim=2)) # [B, T, H]
         attention_layer_2 = self.attention_layer_2(torch.tanh(attention_layer_1)) # [B, T, 1]
+        attention_layer_2 = attention_layer_2.masked_fill(attention_mask.unsqueeze(2), LARGE_NEGATIVE) # [B, T, 1]
         attention_weights = torch.nn.functional.softmax(attention_layer_2, dim=1).transpose(1, 2) # [B, 1, T]
         context = torch.bmm(attention_weights, encoder_output) # [B, 1, H]
         gru_output, gru_hidden = self.GRU(torch.cat([embeds, context], dim=2), decoder_hidden) # [B, S=1, H], [L, B, H]
@@ -424,11 +431,12 @@ class EncoderDecoderGRU(BaseModelClass):
         all_log_probs = torch.zeros(target_length, batch_size, self.output_vocab, device=device) # [S, B, V]
         decoder_input = outputs[:, 0] # [B]
         encoder_output, encoder_hidden = self.encoder(inputs) # [B, T, H], [L, B, H]
+        attention_mask = inputs == data_hyperparameters.PAD_TOKEN # [B, T]
         decoder_output = encoder_output[:, -1, :].unsqueeze(1) # [B, 1, H]
         decoder_hidden = encoder_hidden
         for t in range(1, target_length):
-            log_probs, decoder_output, decoder_hidden = self.decoder(decoder_input, encoder_output, encoder_hidden,
-                                                                     decoder_output, decoder_hidden) # [B, V], [B, 1, H], [L, B, H]
+            log_probs, decoder_output, decoder_hidden = self.decoder(decoder_input, attention_mask, encoder_output,
+                                                                     encoder_hidden, decoder_output, decoder_hidden) # [B, V], [B, 1, H], [L, B, H]
             all_log_probs[t] = log_probs
             decoder_input = outputs[:, t] if teacher_force else torch.argmax(log_probs, dim=1)
         return all_log_probs
@@ -504,10 +512,12 @@ class DecoderLSTM(BaseModelClass):
         self.decoder_type = 'vanilla'
         self.finish_setup()
 
-    def forward(self, inputs, encoder_output, encoder_hidden, encoder_cell, decoder_output, decoder_hidden, decoder_cell):
+    def forward(self, inputs, attention_mask, encoder_output, encoder_hidden, encoder_cell, decoder_output,
+                decoder_hidden, decoder_cell):
         '''
         Pass through one stage of decoding
         :param inputs: Tensor of shape [B] (type long)
+        :param attention_mask: Tensor of shape [B, T] (type bool)
         :param encoder_output: Tensor of shape [B, T, H]
         :param encoder_hidden: Tensor of shape [L, B, H]
         :param encoder_cell: Tensor of shape [L, B, H]
@@ -547,10 +557,12 @@ class DecoderLSTMWithContext(BaseModelClass):
         self.decoder_type = 'context'
         self.finish_setup()
 
-    def forward(self, inputs, encoder_output, encoder_hidden, encoder_cell, decoder_output, decoder_hidden, decoder_cell):
+    def forward(self, inputs, attention_mask, encoder_output, encoder_hidden, encoder_cell, decoder_output,
+                decoder_hidden, decoder_cell):
         '''
         Pass through one stage of decoding
         :param inputs: Tensor of shape [B] (type long)
+        :param attention_mask: Tensor of shape [B, T] (type bool)
         :param encoder_output: Tensor of shape [B, T, H]
         :param encoder_hidden: Tensor of shape [L, B, H]
         :param encoder_cell: Tensor of shape [L, B, H]
@@ -591,10 +603,12 @@ class DecoderLSTMWithDotProductAttention(BaseModelClass):
         self.decoder_type = 'dot_product_attention'
         self.finish_setup()
 
-    def forward(self, inputs, encoder_output, encoder_hidden, encoder_cell, decoder_output, decoder_hidden, decoder_cell):
+    def forward(self, inputs, attention_mask, encoder_output, encoder_hidden, encoder_cell, decoder_output,
+                decoder_hidden, decoder_cell):
         '''
         Pass through one stage of decoding
         :param inputs: Tensor of shape [B] (type long)
+        :param attention_mask: Tensor of shape [B, T] (type bool)
         :param encoder_output: Tensor of shape [B, T, H]
         :param encoder_hidden: Tensor of shape [L, B, H]
         :param encoder_cell: Tensor of shape [L, B, H]
@@ -609,6 +623,7 @@ class DecoderLSTMWithDotProductAttention(BaseModelClass):
         '''
         embeds = self.embedding_dropout(self.embedding(inputs.unsqueeze(1))) # [B, 1, E]
         similarity_scores = torch.bmm(encoder_output, decoder_output.transpose(1, 2)) # [B, T, 1]
+        similarity_scores = similarity_scores.masked_fill(attention_mask.unsqueeze(2), LARGE_NEGATIVE) # [B, T, 1]
         attention_weights = torch.nn.functional.softmax(similarity_scores, dim=1).transpose(1, 2) # [B, 1, T]
         context = torch.bmm(attention_weights, encoder_output) # [B, 1, H]
         lstm_output, (lstm_hidden, lstm_cell) = self.LSTM(torch.cat([embeds, context], dim=2), (decoder_hidden, decoder_cell)) # [B, S=1, H], [L, B, H], [L, B, H]
@@ -639,10 +654,12 @@ class DecoderLSTMWithLearnableAttention(BaseModelClass):
         self.decoder_type = 'learnable_attention'
         self.finish_setup()
 
-    def forward(self, inputs, encoder_output, encoder_hidden, encoder_cell, decoder_output, decoder_hidden, decoder_cell):
+    def forward(self, inputs, attention_mask, encoder_output, encoder_hidden, encoder_cell, decoder_output,
+                decoder_hidden, decoder_cell):
         '''
         Pass through one stage of decoding
         :param inputs: Tensor of shape [B] (type long)
+        :param attention_mask: Tensor of shape [B, T] (type bool)
         :param encoder_output: Tensor of shape [B, T, H]
         :param encoder_hidden: Tensor of shape [L, B, H]
         :param encoder_cell: Tensor of shape [L, B, H]
@@ -659,6 +676,7 @@ class DecoderLSTMWithLearnableAttention(BaseModelClass):
         source_length = encoder_output.shape[1]
         attention_layer_1 = self.attention_layer_1(torch.cat([encoder_output, decoder_output.repeat(1, source_length, 1)], dim=2)) # [B, T, H]
         attention_layer_2 = self.attention_layer_2(torch.tanh(attention_layer_1)) # [B, T, 1]
+        attention_layer_2 = attention_layer_2.masked_fill(attention_mask.unsqueeze(2), LARGE_NEGATIVE) # [B, T, 1]
         attention_weights = torch.nn.functional.softmax(attention_layer_2, dim=1).transpose(1, 2) # [B, 1, T]
         context = torch.bmm(attention_weights, encoder_output) # [B, 1, H]
         lstm_output, (lstm_hidden, lstm_cell) = self.LSTM(torch.cat([embeds, context], dim=2), (decoder_hidden, decoder_cell)) # [B, S=1, H], [L, B, H], [L, B, H]
@@ -724,14 +742,15 @@ class EncoderDecoderLSTM(BaseModelClass):
         all_log_probs = torch.zeros(target_length, batch_size, self.output_vocab, device=device) # [S, B, V]
         decoder_input = outputs[:, 0] # [B]
         encoder_output, encoder_hidden, encoder_cell = self.encoder(inputs) # [B, T, H], [L, B, H], [L, B, H]
+        attention_mask = inputs == data_hyperparameters.PAD_TOKEN  # [B, T]
         decoder_output = encoder_output[:, -1, :].unsqueeze(1) # [B, 1, H]
         decoder_hidden = encoder_hidden
         decoder_cell = encoder_cell
         for t in range(1, target_length):
-            log_probs, decoder_output, decoder_hidden, decoder_cell = self.decoder(decoder_input, encoder_output,
-                                                                                   encoder_hidden, encoder_cell,
-                                                                                   decoder_output, decoder_hidden,
-                                                                                   decoder_cell) # [B, V], [B, 1, H], [L, B, H], [L, B, H]
+            log_probs, decoder_output, decoder_hidden, decoder_cell = self.decoder(decoder_input, attention_mask,
+                                                                                   encoder_output, encoder_hidden,
+                                                                                   encoder_cell, decoder_output,
+                                                                                   decoder_hidden, decoder_cell) # [B, V], [B, 1, H], [L, B, H], [L, B, H]
             all_log_probs[t] = log_probs
             decoder_input = outputs[:, t] if teacher_force else torch.argmax(log_probs, dim=1)
         return all_log_probs
