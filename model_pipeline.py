@@ -71,11 +71,11 @@ def train(model, train_data, valid_data, epochs=data_hyperparameters.EPOCHS, pat
                                           torch.flatten(yb.transpose(0, 1)[1:])).item() for xb, yb in
                             valid_data]) / len(valid_data)
         model.valid_losses.append(loss)
-        scheduler.step(loss)
         write_log('Validation loss: {0}'.format(loss), logger)
         valid_bleu = average_bleu(valid_data, model)
         write_log('Validation BLEU: {0}'.format(valid_bleu), logger)
         model.valid_bleus.append(valid_bleu)
+        scheduler.step(valid_bleu)
         model.num_epochs_trained += 1
         model.teacher_forcing_proportion *= teacher_forcing_scale_factor
         write_log('Epoch took {0} seconds'.format((datetime.now() - now_begin_epoch).total_seconds()), logger)
