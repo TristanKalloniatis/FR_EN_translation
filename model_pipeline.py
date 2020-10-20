@@ -183,7 +183,7 @@ def translate(sentence, input_language, output_language, model):
     with torch.no_grad():
         model.eval()
         output_index = torch.argmax(model(input_index, output_index, teacher_force=False).transpose(0, 1),
-                                    dim=2).squeeze(0).tolist()
+                                    dim=2).squeeze(0).tolist()[1:]  # Remove the first prediction as the model does not fill this (so will be meaningless)
     translation = ''
     for index in output_index:
         if index == data_hyperparameters.EOS_TOKEN:

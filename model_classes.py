@@ -324,7 +324,8 @@ class EncoderDecoderGRU(BaseModelClass):
                  decoder_inter_recurrent_layer_dropout=data_hyperparameters.INTER_RECURRENT_LAYER_DROPOUT,
                  encoder_intra_recurrent_layer_dropout=data_hyperparameters.INTRA_RECURRENT_LAYER_DROPOUT,
                  decoder_intra_recurrent_layer_dropout=data_hyperparameters.INTRA_RECURRENT_LAYER_DROPOUT,
-                 use_packing=True, name='GRU', encoder_name='GRU', decoder_name='GRU'):
+                 use_packing=True, name='GRU', encoder_name='GRU', decoder_name='GRU',
+                 teacher_forcing_proportion_start=data_hyperparameters.TEACHER_FORCING_PROPORTION_START):
         super().__init__()
         self.encoder = EncoderGRU(input_lang, num_layers, bidirectional_encoder, hidden_size,
                                   encoder_embedding_dimension, encoder_embedding_dropout,
@@ -355,6 +356,7 @@ class EncoderDecoderGRU(BaseModelClass):
         else:
             raise Exception('Decoder type {0} not supported'.format(decoder_type))
         self.name = name + '_' + decoder_type + '_decoder'
+        self.teacher_forcing_proportion = teacher_forcing_proportion_start
         self.finish_setup()
 
     def forward(self, inputs, outputs, teacher_force=False):
@@ -641,7 +643,8 @@ class EncoderDecoderLSTM(BaseModelClass):
                  decoder_inter_recurrent_layer_dropout=data_hyperparameters.INTER_RECURRENT_LAYER_DROPOUT,
                  encoder_intra_recurrent_layer_dropout=data_hyperparameters.INTRA_RECURRENT_LAYER_DROPOUT,
                  decoder_intra_recurrent_layer_dropout=data_hyperparameters.INTRA_RECURRENT_LAYER_DROPOUT,
-                 use_packing=True, name='LSTM', encoder_name='LSTM', decoder_name='LSTM'):
+                 use_packing=True, name='LSTM', encoder_name='LSTM', decoder_name='LSTM',
+                 teacher_forcing_proportion_start=data_hyperparameters.TEACHER_FORCING_PROPORTION_START):
         super().__init__()
         self.encoder = EncoderLSTM(input_lang, num_layers, bidirectional_encoder, hidden_size,
                                    encoder_embedding_dimension, encoder_embedding_dropout,
@@ -672,6 +675,7 @@ class EncoderDecoderLSTM(BaseModelClass):
         else:
             raise Exception('Decoder type {0} not supported'.format(decoder_type))
         self.name = name + '_' + decoder_type + '_decoder'
+        self.teacher_forcing_proportion = teacher_forcing_proportion_start
         self.finish_setup()
 
     def forward(self, inputs, outputs, teacher_force=False):
