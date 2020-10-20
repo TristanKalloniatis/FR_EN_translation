@@ -5,51 +5,13 @@ from abc import ABC
 import matplotlib.pyplot as plt
 import datetime
 from math import nan, log
+from model_pipeline import average_bleu
 
 if not os.path.exists('learning_curves/'):
     os.mkdir('learning_curves/')
 
 device = torch.device('cuda' if data_hyperparameters.USE_CUDA else 'cpu')
-
 LARGE_NEGATIVE = -1e9
-
-
-def get_accuracy(loader, model, also_report_model_confidences=False):  # todo: change this
-    if data_hyperparameters.USE_CUDA:
-        model.cuda()
-    model.eval()
-    with torch.no_grad():
-        accuracy = 0.
-        correct_prediction_probs = 0.
-        incorrect_prediction_probs = 0.
-        num_correct = 0
-        num_incorrect = 0
-        for xb, yb in loader:
-            if data_hyperparameters.USE_CUDA and not data_hyperparameters.STORE_DATA_ON_GPU_IF_AVAILABLE:
-                xb = xb.cuda()
-                yb = yb.cuda()
-            model_output = model(xb, yb)
-            yb_length = torch.sum(yb != data_hyperparameters.PAD_TOKEN, dim=-1)
-            packed_model_output_data = torch.nn.utils.rnn.pack_padded_sequence(model_output, yb_length,
-                                                                               batch_first=True,
-                                                                               enforce_sorted=False).data
-            packed_yb_data = torch.nn.utils.rnn.pack_padded_sequence(yb, yb_length, batch_first=True,
-                                                                     enforce_sorted=False).data
-            accuracy += packed_model_output_data.argmax(dim=-1).eq(packed_yb_data).float().mean().item()
-            if also_report_model_confidences:
-                log_probs, predictions = torch.max(packed_model_output_data, dim=-1)
-                probs = torch.exp(log_probs)
-                correct_predictions_mask = torch.where(predictions == packed_yb_data, torch.ones_like(packed_yb_data),
-                                                       torch.zeros_like(packed_yb_data))
-                num_correct += torch.sum(correct_predictions_mask).item()
-                num_incorrect += torch.sum(1 - correct_predictions_mask).item()
-                correct_prediction_probs += torch.sum(correct_predictions_mask * probs).item()
-                incorrect_prediction_probs += torch.sum((1 - correct_predictions_mask) * probs).item()
-    if also_report_model_confidences:
-        return accuracy / len(
-            loader), correct_prediction_probs / num_correct, incorrect_prediction_probs / num_incorrect
-    else:
-        return accuracy / len(loader)
 
 
 class BaseModelClass(torch.nn.Module, ABC):
@@ -57,8 +19,8 @@ class BaseModelClass(torch.nn.Module, ABC):
         super().__init__()
         self.train_losses = []
         self.valid_losses = []
-        self.train_bleus = {}
-        self.valid_bleus = {}
+        self.train_bleus = []
+        self.valid_bleus = []
         self.num_epochs_trained = 0
         self.latest_scheduled_lr = None
         self.lr_history = []
@@ -69,12 +31,6 @@ class BaseModelClass(torch.nn.Module, ABC):
         self.batch_size = data_hyperparameters.BATCH_SIZE
         self.teacher_forcing_proportion = data_hyperparameters.TEACHER_FORCING_PROPORTION_START
         self.teacher_forcing_proportion_history = []
-        self.train_accuracies = {}
-        self.valid_accuracies = {}
-        self.train_correct_confidences = {}
-        self.train_incorrect_confidences = {}
-        self.valid_correct_confidences = {}
-        self.valid_incorrect_confidences = {}
 
     def count_parameters(self):
         self.num_trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -85,12 +41,12 @@ class BaseModelClass(torch.nn.Module, ABC):
     def get_model_performance_data(self, train_dataloader, valid_dataloader, test_dataloader):
         final_train_loss = nan if len(self.train_losses) == 0 else self.train_losses[-1]
         final_valid_loss = nan if len(self.valid_losses) == 0 else self.valid_losses[-1]
-        train_accuracy = get_accuracy(train_dataloader, self)
-        valid_accuracy = get_accuracy(valid_dataloader, self)
-        test_accuracy = get_accuracy(test_dataloader, self)
+        final_train_bleu = average_bleu(train_dataloader, self)
+        final_valid_bleu = average_bleu(valid_dataloader, self)
+        final_test_bleu = average_bleu(test_dataloader, self)
         average_time_per_epoch = nan if self.num_epochs_trained == 0 else self.train_time / self.num_epochs_trained
-        model_data = {'name': self.name, 'train_accuracy': train_accuracy, 'valid_accuracy': valid_accuracy,
-                      'test_accuracy': test_accuracy, 'total_train_time': self.train_time,
+        model_data = {'name': self.name, 'total_train_time': self.train_time, 'final_train_bleu': final_train_bleu,
+                      'final_valid_bleu': final_valid_bleu, 'final_test_bleu': final_test_bleu,
                       'num_epochs': self.num_epochs_trained, 'trainable_params': self.num_trainable_params,
                       'final_train_loss': final_train_loss, 'final_valid_loss': final_valid_loss,
                       'model_created': self.instantiated, 'average_time_per_epoch': average_time_per_epoch,
@@ -116,48 +72,14 @@ class BaseModelClass(torch.nn.Module, ABC):
         ax.legend()
         plt.savefig('learning_curves/teacher_forcing_proportions_{0}.png'.format(self.name))
 
-        if len(self.train_bleus) != 0:
-            fig, ax = plt.subplots()
-            epochs = list(self.train_bleus.keys())
-            train_bleus = list(self.train_bleus.values())
-            valid_bleus = list(self.valid_bleus.values())
-            ax.scatter(epochs, train_bleus, label='Training')
-            ax.scatter(epochs, valid_bleus, label='Validation')
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('BLEU')
-            ax.set_title('BLEU scores for {0}'.format(self.name))
-            ax.legend()
-            plt.savefig('learning_curves/bleus_{0}.png'.format(self.name))
-
-        if len(self.train_accuracies) != 0:
-            fig, ax = plt.subplots()
-            epochs = list(self.train_accuracies.keys())
-            train_accuracies = list(self.train_accuracies.values())
-            valid_accuracies = list(self.valid_accuracies.values())
-            ax.scatter(epochs, train_accuracies, label='Training')
-            ax.scatter(epochs, valid_accuracies, label='Validation')
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Accuracy')
-            ax.set_title('Accuracies for {0}'.format(self.name))
-            ax.legend()
-            plt.savefig('learning_curves/accuracies_{0}.png'.format(self.name))
-
-        if len(self.train_correct_confidences) != 0:
-            fig, ax = plt.subplots()
-            epochs = list(self.train_correct_confidences.keys())
-            train_correct_confidences = list(self.train_correct_confidences.values())
-            train_incorrect_confidences = list(self.train_incorrect_confidences.values())
-            valid_correct_confidences = list(self.valid_correct_confidences.values())
-            valid_incorrect_confidences = list(self.valid_incorrect_confidences.values())
-            ax.scatter(epochs, train_correct_confidences, label='Training (correct predictions)')
-            ax.scatter(epochs, valid_correct_confidences, label='Validation (correct predictions)')
-            ax.scatter(epochs, train_incorrect_confidences, label='Training (incorrect predictions)')
-            ax.scatter(epochs, valid_incorrect_confidences, label='Validation (incorrect predictions)')
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Confidence')
-            ax.set_title('Confidences for {0}'.format(self.name))
-            ax.legend()
-            plt.savefig('learning_curves/confidences_{0}.png'.format(self.name))
+        fig, ax = plt.subplots()
+        ax.scatter(range(self.num_epochs_trained), self.train_bleus, label='Training')
+        ax.scatter(range(self.num_epochs_trained), self.valid_bleus, label='Validation')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('BLEU')
+        ax.set_title('BLEU scores for {0}'.format(self.name))
+        ax.legend()
+        plt.savefig('learning_curves/bleus_{0}.png'.format(self.name))
 
         if include_lrs:
             fig, ax = plt.subplots()

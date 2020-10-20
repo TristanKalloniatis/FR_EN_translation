@@ -12,18 +12,18 @@ LOG_FILE = 'data_downloader'
 logger = create_logger(LOG_FILE)
 device = torch.device('cuda' if data_hyperparameters.USE_CUDA and data_hyperparameters.STORE_DATA_ON_GPU_IF_AVAILABLE else 'cpu')
 DATA_FILE = 'data/eng-fra.txt'
-EN_WORD_TO_INDEX_FILE = 'english_WORD_TO_INDEX.pkl'
-EN_WORD_TO_COUNT_FILE = 'english_WORD_TO_COUNT.pkl'
-EN_INDEX_TO_WORD_FILE = 'english_INDEX_TO_WORD.pkl'
-FR_WORD_TO_INDEX_FILE = 'french_WORD_TO_INDEX.pkl'
-FR_WORD_TO_COUNT_FILE = 'french_WORD_TO_COUNT.pkl'
-FR_INDEX_TO_WORD_FILE = 'french_INDEX_TO_WORD.pkl'
-EN_FIT_INDEX_FILE = 'english_FIT_INDEX.pkl'
-EN_VALID_INDEX_FILE = 'english_VALID_INDEX.pkl'
-EN_TEST_INDEX_FILE = 'english_TEST_INDEX.pkl'
-FR_FIT_INDEX_FILE = 'french_FIT_INDEX.pkl'
-FR_VALID_INDEX_FILE = 'french_VALID_INDEX.pkl'
-FR_TEST_INDEX_FILE = 'french_TEST_INDEX.pkl'
+EN_WORD_TO_INDEX_FILE = 'en_WORD_TO_INDEX_MAX_{0}.pkl'.format(data_hyperparameters.MAX_LENGTH)
+EN_WORD_TO_COUNT_FILE = 'en_WORD_TO_COUNT_MAX_{0}.pkl'.format(data_hyperparameters.MAX_LENGTH)
+EN_INDEX_TO_WORD_FILE = 'en_INDEX_TO_WORD_MAX_{0}.pkl'.format(data_hyperparameters.MAX_LENGTH)
+FR_WORD_TO_INDEX_FILE = 'fr_WORD_TO_INDEX_MAX_{0}.pkl'.format(data_hyperparameters.MAX_LENGTH)
+FR_WORD_TO_COUNT_FILE = 'fr_WORD_TO_COUNT_MAX_{0}.pkl'.format(data_hyperparameters.MAX_LENGTH)
+FR_INDEX_TO_WORD_FILE = 'fr_INDEX_TO_WORD_MAX_{0}.pkl'.format(data_hyperparameters.MAX_LENGTH)
+EN_FIT_INDEX_FILE = 'en_FIT_INDEX_MAX_{0}.pkl'.format(data_hyperparameters.MAX_LENGTH)
+EN_VALID_INDEX_FILE = 'en_VALID_INDEX_MAX_{0}.pkl'.format(data_hyperparameters.MAX_LENGTH)
+EN_TEST_INDEX_FILE = 'en_TEST_INDEX_MAX_{0}.pkl'.format(data_hyperparameters.MAX_LENGTH)
+FR_FIT_INDEX_FILE = 'fr_FIT_INDEX_MAX_{0}.pkl'.format(data_hyperparameters.MAX_LENGTH)
+FR_VALID_INDEX_FILE = 'fr_VALID_INDEX_MAX_{0}.pkl'.format(data_hyperparameters.MAX_LENGTH)
+FR_TEST_INDEX_FILE = 'fr_TEST_INDEX_MAX_{0}.pkl'.format(data_hyperparameters.MAX_LENGTH)
 
 
 def save_data(data, path):
@@ -33,19 +33,17 @@ def save_data(data, path):
 
 
 def prepare_data(batch_size=data_hyperparameters.BATCH_SIZE):
-    english = Language('english')
-    french = Language('french')
+    english = Language('en')
+    french = Language('fr')
     if not os.path.exists(EN_WORD_TO_INDEX_FILE) or not os.path.exists(EN_WORD_TO_COUNT_FILE) or not os.path.exists(EN_INDEX_TO_WORD_FILE) or not os.path.exists(FR_WORD_TO_INDEX_FILE) or not os.path.exists(FR_WORD_TO_COUNT_FILE) or not os.path.exists(FR_INDEX_TO_WORD_FILE) or not os.path.exists(EN_FIT_INDEX_FILE) or not os.path.exists(EN_VALID_INDEX_FILE) or not os.path.exists(EN_TEST_INDEX_FILE) or not os.path.exists(FR_FIT_INDEX_FILE) or not os.path.exists(FR_VALID_INDEX_FILE) or not os.path.exists(FR_TEST_INDEX_FILE):
         en_sentences = []
         fr_sentences = []
-        en_tokenizer = spacy.load('en').tokenizer
-        fr_tokenizer = spacy.load('fr').tokenizer
         write_log('Reading sentence pairs from file', logger)
         with open(DATA_FILE, mode='r', encoding='utf-8') as f:
             for line in f:
                 en_sentence, fr_sentence = line.strip().split('\t')
-                en_sentence = [t.text for t in en_tokenizer(normalize_string(en_sentence))]
-                fr_sentence = [t.text for t in fr_tokenizer(normalize_string(fr_sentence))]
+                en_sentence = [t.text for t in english.tokenizer(normalize_string(en_sentence))]
+                fr_sentence = [t.text for t in french.tokenizer(normalize_string(fr_sentence))]
                 #todo: remove this filtration
                 if len(en_sentence) > data_hyperparameters.MAX_LENGTH or len(fr_sentence) > data_hyperparameters.MAX_LENGTH:
                     continue
@@ -77,10 +75,10 @@ def prepare_data(batch_size=data_hyperparameters.BATCH_SIZE):
         fr_sentences_test_index = french.index_sentences(fr_sentences_test)
         save_data(fr_sentences_test_index, FR_TEST_INDEX_FILE)
     else:
-        write_log('Loading languages from disk', logger)
+        write_log('Loading languages from disk cache', logger)
         english.load()
         french.load()
-        write_log('Loading indexed sentences from disk', logger)
+        write_log('Loading indexed sentences from disk cache', logger)
         en_sentences_fit_index = pickle.load(open(EN_FIT_INDEX_FILE, 'rb'))
         en_sentences_valid_index = pickle.load(open(EN_VALID_INDEX_FILE, 'rb'))
         en_sentences_test_index = pickle.load(open(EN_TEST_INDEX_FILE, 'rb'))
@@ -106,6 +104,7 @@ class Language:
                               data_hyperparameters.PAD_TOKEN: '<PAD>', data_hyperparameters.UNK_TOKEN: '<UNK>'}
         self.n_words = 4
         self.min_occurences = min_occurences
+        self.tokenizer = spacy.load(name).tokenizer
 
     def read(self, sentences):
         for sentence in sentences:

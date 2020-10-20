@@ -4,7 +4,6 @@ from datetime import datetime
 import os
 import csv
 from log_utils import create_logger, write_log
-from model_classes import get_accuracy
 from pickle import dump, load
 from data_downloader import normalize_string
 from random import random
@@ -16,16 +15,17 @@ logger = create_logger(LOG_FILE)
 if not os.path.exists('saved_models/'):
     os.mkdir('saved_models/')
 
+device = torch.device('cuda' if data_hyperparameters.USE_CUDA else 'cpu')
+
 
 def train(model, train_data, valid_data, epochs=data_hyperparameters.EPOCHS, patience=data_hyperparameters.PATIENCE,
-          report_accuracy_every=data_hyperparameters.REPORT_ACCURACY_EVERY,
-          report_bleu_every=data_hyperparameters.REPORT_BLEU_EVERY):
+          teacher_forcing_scale_factor=data_hyperparameters.TEACHER_FORCING_SCALE_FACTOR):
     loss_function = torch.nn.NLLLoss(ignore_index=data_hyperparameters.PAD_TOKEN)
     if data_hyperparameters.USE_CUDA:
         model.cuda()
     optimiser = torch.optim.Adam(model.parameters()) if model.latest_scheduled_lr is None else torch.optim.Adam(
         model.parameters(), lr=model.latest_scheduled_lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimiser, patience=patience)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimiser, patience=patience, mode='max')
     now_begin_training = datetime.now()
     start_epoch = model.num_epochs_trained
     for epoch in range(start_epoch, epochs + start_epoch):
@@ -55,24 +55,9 @@ def train(model, train_data, valid_data, epochs=data_hyperparameters.EPOCHS, pat
         model.train_losses.append(loss)
         write_log('Training loss: {0}'.format(loss), logger)
         model.eval()
-        if report_accuracy_every is not None:
-            if (epoch + 1) % report_accuracy_every == 0:
-                accuracy, mean_correct_prediction_probs, mean_incorrect_prediction_probs = get_accuracy(train_data,
-                                                                                                        model,
-                                                                                                        also_report_model_confidences=True)
-                write_log('Training accuracy: {0}'.format(accuracy), logger)
-                model.train_accuracies[epoch + 1] = accuracy
-                write_log('Model confidence: {0} (correct predictions), {1} (incorrect predictions)'.format(
-                    mean_correct_prediction_probs,
-                    mean_incorrect_prediction_probs),
-                    logger)
-                model.train_correct_confidences[epoch + 1] = mean_correct_prediction_probs
-                model.train_incorrect_confidences[epoch + 1] = mean_incorrect_prediction_probs
-        if report_bleu_every is not None:
-            if (epoch + 1) % report_bleu_every == 0:
-                bleu = average_bleu(train_data, model)
-                write_log('Training BLEU: {0}'.format(bleu), logger)
-                model.train_bleus[epoch + 1] = bleu
+        train_bleu = average_bleu(train_data, model)
+        write_log('Training BLEU: {0}'.format(train_bleu), logger)
+        model.train_bleus.append(train_bleu)
         with torch.no_grad():
             if data_hyperparameters.USE_CUDA and not data_hyperparameters.STORE_DATA_ON_GPU_IF_AVAILABLE:
                 loss = 0.
@@ -88,26 +73,11 @@ def train(model, train_data, valid_data, epochs=data_hyperparameters.EPOCHS, pat
         model.valid_losses.append(loss)
         scheduler.step(loss)
         write_log('Validation loss: {0}'.format(loss), logger)
-        if report_accuracy_every is not None:
-            if (epoch + 1) % report_accuracy_every == 0:
-                accuracy, mean_correct_prediction_probs, mean_incorrect_prediction_probs = get_accuracy(valid_data,
-                                                                                                        model,
-                                                                                                        also_report_model_confidences=True)
-                write_log('Validation accuracy: {0}'.format(accuracy), logger)
-                model.valid_accuracies[epoch + 1] = accuracy
-                write_log('Model confidence: {0} (correct predictions), {1} (incorrect predictions)'.format(
-                    mean_correct_prediction_probs,
-                    mean_incorrect_prediction_probs),
-                    logger)
-                model.valid_correct_confidences[epoch + 1] = mean_correct_prediction_probs
-                model.valid_incorrect_confidences[epoch + 1] = mean_incorrect_prediction_probs
-        if report_bleu_every is not None:
-            if (epoch + 1) % report_bleu_every == 0:
-                bleu = average_bleu(valid_data, model)
-                write_log('Validation BLEU: {0}'.format(bleu), logger)
-                model.valid_bleus[epoch + 1] = bleu
+        valid_bleu = average_bleu(valid_data, model)
+        write_log('Validation BLEU: {0}'.format(valid_bleu), logger)
+        model.valid_bleus.append(valid_bleu)
         model.num_epochs_trained += 1
-        model.teacher_forcing_proportion *= data_hyperparameters.TEACHER_FORCING_SCALE_FACTOR
+        model.teacher_forcing_proportion *= teacher_forcing_scale_factor
         write_log('Epoch took {0} seconds'.format((datetime.now() - now_begin_epoch).total_seconds()), logger)
     model.train_time += (datetime.now() - now_begin_training).total_seconds()
     if data_hyperparameters.USE_CUDA:
@@ -131,11 +101,13 @@ def report_statistics(model, train_data, valid_data, test_data):
 def save_model(model):
     torch.save(model.state_dict(), 'saved_models/{0}.pt'.format(model.name))
     model_data = {'train_losses': model.train_losses, 'valid_losses': model.valid_losses,
+                  'train_bleus': model.train_bleus, 'valid_bleus': model.valid_bleus,
                   'num_epochs_trained': model.num_epochs_trained, 'latest_scheduled_lr': model.latest_scheduled_lr,
-                  'train_time': model.train_time, 'num_trainable_params': model.num_trainable_params,
-                  'instantiated': model.instantiated, 'name': model.name, 'vocab_size': model.vocab_size,
-                  'tokenizer': model.tokenizer, 'batch_size': model.batch_size,
-                  'train_accuracies': model.train_accuracies, 'valid_accuracies': model.valid_accuracies}
+                  'lr_history': model.lr_history, 'train_time': model.train_time,
+                  'num_trainable_params': model.num_trainable_params, 'instantiated': model.instantiated,
+                  'name': model.name, 'batch_size': model.batch_size,
+                  'teacher_forcing_proportion': model.teacher_forcing_proportion,
+                  'teacher_forcing_proportion_history': model.teacher_forcing_proportion_history}
     outfile = open('saved_models/{0}_model_data.pkl'.format(model.name), 'wb')
     dump(model_data, outfile)
     outfile.close()
@@ -149,17 +121,18 @@ def load_model_state(model, model_name):
     infile.close()
     model.train_losses = model_data['train_losses']
     model.valid_losses = model_data['valid_losses']
+    model.train_bleus = model_data['train_bleus']
+    model.valid_bleus = model_data['valid_bleus']
     model.num_epochs_trained = model_data['num_epochs_trained']
     model.latest_scheduled_lr = model_data['latest_scheduled_lr']
+    model.lr_history = model_data['lr_history']
     model.train_time = model_data['train_time']
     model.num_trainable_params = model_data['num_trainable_params']
     model.instantiated = model_data['instantiated']
     model.name = model_data['name']
-    model.vocab_size = model_data['vocab_size']
-    model.tokenizer = model_data['tokenizer']
     model.batch_size = model_data['batch_size']
-    model.train_accuracies = model_data['train_accuracies']
-    model.valid_accuracies = model_data['valid_accuracies']
+    model.teacher_forcing_proportion = model_data['teacher_forcing_proportion']
+    model.teacher_forcing_proportion_history = model_data['teacher_forcing_proportion_history']
     write_log('Loaded model {0} state'.format(model_name), logger)
 
 
@@ -176,7 +149,7 @@ def remove_tokens(indices):
 def evaluate_bleu_index_batch(reference_batch, candidate_batch):
     batch_size = reference_batch.shape[0]
     chencherry = SmoothingFunction()
-    results = torch.zeros(batch_size, device='cuda' if data_hyperparameters.USE_CUDA else 'cpu')
+    results = torch.zeros(batch_size, device=device)
     for b in range(batch_size):
         reference = remove_tokens(reference_batch[b, :].tolist())
         candidate = remove_tokens(candidate_batch[b, :].tolist())
@@ -198,3 +171,22 @@ def average_bleu(data, model):
             bleu_batch = evaluate_bleu_index_batch(yb, translations)
             avg_bleu += torch.mean(bleu_batch).item()
     return 100 * avg_bleu / len(data)
+
+
+def translate(sentence, input_language, output_language, model):
+    tokenized_sentence = [t.text for t in input_language.tokenizer(normalize_string(sentence.strip()))]
+    input_index = torch.tensor(input_language.index_sentences([tokenized_sentence]), device=device)
+    output_index = torch.zeros(1, data_hyperparameters.MAX_LENGTH, dtype=torch.long, device=device).fill_(
+        data_hyperparameters.SOS_TOKEN)
+    if data_hyperparameters.USE_CUDA:
+        model.cuda()
+    with torch.no_grad():
+        model.eval()
+        output_index = torch.argmax(model(input_index, output_index, teacher_force=False).transpose(0, 1),
+                                    dim=2).squeeze(0).tolist()
+    translation = ''
+    for index in output_index:
+        if index == data_hyperparameters.EOS_TOKEN:
+            break
+        translation = translation + ' ' + output_language.index_to_word[index]
+    return translation.strip()
