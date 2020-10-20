@@ -8,6 +8,7 @@ from model_classes import get_accuracy
 from pickle import dump, load
 from data_downloader import normalize_string
 from random import random
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
 LOG_FILE = 'model_pipeline'
 logger = create_logger(LOG_FILE)
@@ -17,11 +18,13 @@ if not os.path.exists('saved_models/'):
 
 
 def train(model, train_data, valid_data, epochs=data_hyperparameters.EPOCHS, patience=data_hyperparameters.PATIENCE,
-          report_accuracy_every=data_hyperparameters.REPORT_ACCURACY_EVERY):
+          report_accuracy_every=data_hyperparameters.REPORT_ACCURACY_EVERY,
+          report_bleu_every=data_hyperparameters.REPORT_BLEU_EVERY):
     loss_function = torch.nn.NLLLoss(ignore_index=data_hyperparameters.PAD_TOKEN)
     if data_hyperparameters.USE_CUDA:
         model.cuda()
-    optimiser = torch.optim.Adam(model.parameters()) if model.latest_scheduled_lr is None else torch.optim.Adam(model.parameters(), lr=model.latest_scheduled_lr)
+    optimiser = torch.optim.Adam(model.parameters()) if model.latest_scheduled_lr is None else torch.optim.Adam(
+        model.parameters(), lr=model.latest_scheduled_lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimiser, patience=patience)
     now_begin_training = datetime.now()
     start_epoch = model.num_epochs_trained
@@ -42,7 +45,9 @@ def train(model, train_data, valid_data, epochs=data_hyperparameters.EPOCHS, pat
                 xb = xb.cuda()
                 yb = yb.cuda()
             teacher_force = random() < model.teacher_forcing_proportion
-            batch_loss = loss_function(torch.flatten(model(xb, yb, teacher_force=teacher_force)[1:], start_dim=0, end_dim=1), torch.flatten(yb.transpose(0, 1)[1:]))
+            batch_loss = loss_function(
+                torch.flatten(model(xb, yb, teacher_force=teacher_force)[1:], start_dim=0, end_dim=1),
+                torch.flatten(yb.transpose(0, 1)[1:]))
             loss += batch_loss.item() / len(train_data)
             optimiser.zero_grad()
             batch_loss.backward()
@@ -60,18 +65,26 @@ def train(model, train_data, valid_data, epochs=data_hyperparameters.EPOCHS, pat
                 write_log('Model confidence: {0} (correct predictions), {1} (incorrect predictions)'.format(
                     mean_correct_prediction_probs,
                     mean_incorrect_prediction_probs),
-                          logger)
+                    logger)
                 model.train_correct_confidences[epoch + 1] = mean_correct_prediction_probs
                 model.train_incorrect_confidences[epoch + 1] = mean_incorrect_prediction_probs
+        if report_bleu_every is not None:
+            if (epoch + 1) % report_bleu_every == 0:
+                bleu = average_bleu(train_data, model)
+                write_log('Training BLEU: {0}'.format(bleu), logger)
+                model.train_bleus[epoch + 1] = bleu
         with torch.no_grad():
             if data_hyperparameters.USE_CUDA and not data_hyperparameters.STORE_DATA_ON_GPU_IF_AVAILABLE:
                 loss = 0.
                 for xb, yb in valid_data:
                     xb = xb.cuda()
                     yb = yb.cuda()
-                    loss += loss_function(torch.flatten(model(xb, yb, teacher_force=False)[1:], start_dim=0, end_dim=1), torch.flatten(yb.transpose(0, 1)[1:])).item() / len(valid_data)
+                    loss += loss_function(torch.flatten(model(xb, yb, teacher_force=False)[1:], start_dim=0, end_dim=1),
+                                          torch.flatten(yb.transpose(0, 1)[1:])).item() / len(valid_data)
             else:
-                loss = sum([loss_function(torch.flatten(model(xb, yb, teacher_force=False)[1:], start_dim=0, end_dim=1), torch.flatten(yb.transpose(0, 1)[1:])).item() for xb, yb in valid_data]) / len(valid_data)
+                loss = sum([loss_function(torch.flatten(model(xb, yb, teacher_force=False)[1:], start_dim=0, end_dim=1),
+                                          torch.flatten(yb.transpose(0, 1)[1:])).item() for xb, yb in
+                            valid_data]) / len(valid_data)
         model.valid_losses.append(loss)
         scheduler.step(loss)
         write_log('Validation loss: {0}'.format(loss), logger)
@@ -85,9 +98,14 @@ def train(model, train_data, valid_data, epochs=data_hyperparameters.EPOCHS, pat
                 write_log('Model confidence: {0} (correct predictions), {1} (incorrect predictions)'.format(
                     mean_correct_prediction_probs,
                     mean_incorrect_prediction_probs),
-                          logger)
+                    logger)
                 model.valid_correct_confidences[epoch + 1] = mean_correct_prediction_probs
                 model.valid_incorrect_confidences[epoch + 1] = mean_incorrect_prediction_probs
+        if report_bleu_every is not None:
+            if (epoch + 1) % report_bleu_every == 0:
+                bleu = average_bleu(valid_data, model)
+                write_log('Validation BLEU: {0}'.format(bleu), logger)
+                model.valid_bleus[epoch + 1] = bleu
         model.num_epochs_trained += 1
         model.teacher_forcing_proportion *= data_hyperparameters.TEACHER_FORCING_SCALE_FACTOR
         write_log('Epoch took {0} seconds'.format((datetime.now() - now_begin_epoch).total_seconds()), logger)
@@ -143,3 +161,40 @@ def load_model_state(model, model_name):
     model.train_accuracies = model_data['train_accuracies']
     model.valid_accuracies = model_data['valid_accuracies']
     write_log('Loaded model {0} state'.format(model_name), logger)
+
+
+def remove_tokens(indices):
+    result = []
+    for i in range(1, len(indices)):
+        if indices[i] != data_hyperparameters.EOS_TOKEN:
+            result.append(indices[i])
+        else:
+            break
+    return result
+
+
+def evaluate_bleu_index_batch(reference_batch, candidate_batch):
+    batch_size = reference_batch.shape[0]
+    chencherry = SmoothingFunction()
+    results = torch.zeros(batch_size, device='cuda' if data_hyperparameters.USE_CUDA else 'cpu')
+    for b in range(batch_size):
+        reference = remove_tokens(reference_batch[b, :].tolist())
+        candidate = remove_tokens(candidate_batch[b, :].tolist())
+        results[b] = sentence_bleu([reference], candidate, smoothing_function=chencherry.method1)
+    return results
+
+
+def average_bleu(data, model):
+    avg_bleu = 0.
+    if data_hyperparameters.USE_CUDA:
+        model.cuda()
+    with torch.no_grad():
+        model.eval()
+        for xb, yb in data:
+            if data_hyperparameters.USE_CUDA and not data_hyperparameters.STORE_DATA_ON_GPU_IF_AVAILABLE:
+                xb = xb.cuda()
+                yb = yb.cuda()
+            translations = torch.argmax(model(xb, yb, teacher_force=False).transpose(0, 1), dim=2)  # [B, S]
+            bleu_batch = evaluate_bleu_index_batch(yb, translations)
+            avg_bleu += torch.mean(bleu_batch).item()
+    return 100 * avg_bleu / len(data)

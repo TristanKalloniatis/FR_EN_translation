@@ -13,7 +13,8 @@ device = torch.device('cuda' if data_hyperparameters.USE_CUDA else 'cpu')
 
 LARGE_NEGATIVE = -1e9
 
-def get_accuracy(loader, model, also_report_model_confidences=False):
+
+def get_accuracy(loader, model, also_report_model_confidences=False):  # todo: change this
     if data_hyperparameters.USE_CUDA:
         model.cuda()
     model.eval()
@@ -56,6 +57,8 @@ class BaseModelClass(torch.nn.Module, ABC):
         super().__init__()
         self.train_losses = []
         self.valid_losses = []
+        self.train_bleus = {}
+        self.valid_bleus = {}
         self.num_epochs_trained = 0
         self.latest_scheduled_lr = None
         self.lr_history = []
@@ -112,6 +115,19 @@ class BaseModelClass(torch.nn.Module, ABC):
         ax.set_title('Teacher forcing proportions for {0}'.format(self.name))
         ax.legend()
         plt.savefig('learning_curves/teacher_forcing_proportions_{0}.png'.format(self.name))
+
+        if len(self.train_bleus) != 0:
+            fig, ax = plt.subplots()
+            epochs = list(self.train_bleus.keys())
+            train_bleus = list(self.train_bleus.values())
+            valid_bleus = list(self.valid_bleus.values())
+            ax.scatter(epochs, train_bleus, label='Training')
+            ax.scatter(epochs, valid_bleus, label='Validation')
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('BLEU')
+            ax.set_title('BLEU scores for {0}'.format(self.name))
+            ax.legend()
+            plt.savefig('learning_curves/bleus_{0}.png'.format(self.name))
 
         if len(self.train_accuracies) != 0:
             fig, ax = plt.subplots()
@@ -181,19 +197,19 @@ class EncoderGRU(BaseModelClass):
         encoder_output: Tensor of shape [B, T, DH] where D = num_directions
         encoder_hidden: Tensor of shape [L, B, DH] where D = num_directions
         '''
-        embeds = self.embedding_dropout(self.embedding(inputs)) # [B, T, E]
+        embeds = self.embedding_dropout(self.embedding(inputs))  # [B, T, E]
         if self.use_packing:
-            input_length = torch.sum(inputs != data_hyperparameters.PAD_TOKEN, dim=-1) # [B]
+            input_length = torch.sum(inputs != data_hyperparameters.PAD_TOKEN, dim=-1)  # [B]
             embeds = torch.nn.utils.rnn.pack_padded_sequence(embeds, input_length, enforce_sorted=False,
                                                              batch_first=True)
-        encoder_output, encoder_hidden = self.GRU(embeds) # [B, T, DH], [LD, B, H]
+        encoder_output, encoder_hidden = self.GRU(embeds)  # [B, T, DH], [LD, B, H]
         if self.use_packing:
             encoder_output, _ = torch.nn.utils.rnn.pad_packed_sequence(encoder_output, batch_first=True)
         if not self.bidirectional:
             return encoder_output, encoder_hidden
-        encoder_hidden = encoder_hidden.view(self.num_layers, 2, -1, self.hidden_size) # [L, D=2, B, H]
-        encoder_hidden = encoder_hidden.transpose(1, 2) # [L, B, D=2, H]
-        encoder_hidden_forward = encoder_hidden[:, :, 0, :] # [L, B, H]
+        encoder_hidden = encoder_hidden.view(self.num_layers, 2, -1, self.hidden_size)  # [L, D=2, B, H]
+        encoder_hidden = encoder_hidden.transpose(1, 2)  # [L, B, D=2, H]
+        encoder_hidden_forward = encoder_hidden[:, :, 0, :]  # [L, B, H]
         encoder_hidden_backward = encoder_hidden[:, :, 1, :]  # [L, B, H]
         return encoder_output, torch.cat([encoder_hidden_forward, encoder_hidden_backward], dim=2)
 
@@ -231,10 +247,10 @@ class DecoderGRU(BaseModelClass):
         gru_output: Tensor of shape [B, S=1, H]
         gru_hidden: Tensor of shape [L, B, H]
         '''
-        embeds = self.embedding_dropout(self.embedding(inputs.unsqueeze(1))) # [B, 1, E]
-        gru_output, gru_hidden = self.GRU(embeds, decoder_hidden) # [B, S=1, H], [L, B, H]
-        proj = self.linear(gru_output.squeeze(1)) # [B, V]
-        log_probs = torch.nn.functional.log_softmax(proj, dim=1) # [B, V]
+        embeds = self.embedding_dropout(self.embedding(inputs.unsqueeze(1)))  # [B, 1, E]
+        gru_output, gru_hidden = self.GRU(embeds, decoder_hidden)  # [B, S=1, H], [L, B, H]
+        proj = self.linear(gru_output.squeeze(1))  # [B, V]
+        log_probs = torch.nn.functional.log_softmax(proj, dim=1)  # [B, V]
         return log_probs, gru_output, gru_hidden
 
 
@@ -272,11 +288,11 @@ class DecoderGRUWithContext(BaseModelClass):
         gru_output: Tensor of shape [B, S=1, H]
         gru_hidden: Tensor of shape [L, B, H]
         '''
-        embeds = self.embedding_dropout(self.embedding(inputs.unsqueeze(1))) # [B, 1, E]
-        context = encoder_hidden[-1, :, :].unsqueeze(1) # [B, 1, H]
-        gru_output, gru_hidden = self.GRU(torch.cat([embeds, context], dim=2), decoder_hidden) # [B, S=1, H], [L, B, H]
-        proj = self.linear(torch.cat([gru_output, context, embeds], dim=2).squeeze(1)) # [B, V]
-        log_probs = torch.nn.functional.log_softmax(proj, dim=1) # [B, V]
+        embeds = self.embedding_dropout(self.embedding(inputs.unsqueeze(1)))  # [B, 1, E]
+        context = encoder_hidden[-1, :, :].unsqueeze(1)  # [B, 1, H]
+        gru_output, gru_hidden = self.GRU(torch.cat([embeds, context], dim=2), decoder_hidden)  # [B, S=1, H], [L, B, H]
+        proj = self.linear(torch.cat([gru_output, context, embeds], dim=2).squeeze(1))  # [B, V]
+        log_probs = torch.nn.functional.log_softmax(proj, dim=1)  # [B, V]
         return log_probs, gru_output, gru_hidden
 
 
@@ -314,14 +330,14 @@ class DecoderGRUWithDotProductAttention(BaseModelClass):
         gru_output: Tensor of shape [B, S=1, H]
         gru_hidden: Tensor of shape [L, B, H]
         '''
-        embeds = self.embedding_dropout(self.embedding(inputs.unsqueeze(1))) # [B, 1, E]
-        similarity_scores = torch.bmm(encoder_output, decoder_output.transpose(1, 2)) # [B, T, 1]
-        similarity_scores = similarity_scores.masked_fill(attention_mask.unsqueeze(2), LARGE_NEGATIVE) # [B, T, 1]
-        attention_weights = torch.nn.functional.softmax(similarity_scores, dim=1).transpose(1, 2) # [B, 1, T]
-        context = torch.bmm(attention_weights, encoder_output) # [B, 1, H]
-        gru_output, gru_hidden = self.GRU(torch.cat([embeds, context], dim=2), decoder_hidden) # [B, S=1, H], [L, B, H]
-        proj = self.linear(torch.cat([gru_output, context, embeds], dim=2).squeeze(1)) # [B, V]
-        log_probs = torch.nn.functional.log_softmax(proj, dim=1) # [B, V]
+        embeds = self.embedding_dropout(self.embedding(inputs.unsqueeze(1)))  # [B, 1, E]
+        similarity_scores = torch.bmm(encoder_output, decoder_output.transpose(1, 2))  # [B, T, 1]
+        similarity_scores = similarity_scores.masked_fill(attention_mask.unsqueeze(2), LARGE_NEGATIVE)  # [B, T, 1]
+        attention_weights = torch.nn.functional.softmax(similarity_scores, dim=1).transpose(1, 2)  # [B, 1, T]
+        context = torch.bmm(attention_weights, encoder_output)  # [B, 1, H]
+        gru_output, gru_hidden = self.GRU(torch.cat([embeds, context], dim=2), decoder_hidden)  # [B, S=1, H], [L, B, H]
+        proj = self.linear(torch.cat([gru_output, context, embeds], dim=2).squeeze(1))  # [B, V]
+        log_probs = torch.nn.functional.log_softmax(proj, dim=1)  # [B, V]
         return log_probs, gru_output, gru_hidden
 
 
@@ -361,16 +377,17 @@ class DecoderGRUWithLearnableAttention(BaseModelClass):
         gru_output: Tensor of shape [B, S=1, H]
         gru_hidden: Tensor of shape [L, B, H]
         '''
-        embeds = self.embedding_dropout(self.embedding(inputs.unsqueeze(1))) # [B, 1, E]
+        embeds = self.embedding_dropout(self.embedding(inputs.unsqueeze(1)))  # [B, 1, E]
         source_length = encoder_output.shape[1]
-        attention_layer_1 = self.attention_layer_1(torch.cat([encoder_output, decoder_output.repeat(1, source_length, 1)], dim=2)) # [B, T, H]
-        attention_layer_2 = self.attention_layer_2(torch.tanh(attention_layer_1)) # [B, T, 1]
-        attention_layer_2 = attention_layer_2.masked_fill(attention_mask.unsqueeze(2), LARGE_NEGATIVE) # [B, T, 1]
-        attention_weights = torch.nn.functional.softmax(attention_layer_2, dim=1).transpose(1, 2) # [B, 1, T]
-        context = torch.bmm(attention_weights, encoder_output) # [B, 1, H]
-        gru_output, gru_hidden = self.GRU(torch.cat([embeds, context], dim=2), decoder_hidden) # [B, S=1, H], [L, B, H]
-        proj = self.linear(torch.cat([gru_output, context, embeds], dim=2).squeeze(1)) # [B, V]
-        log_probs = torch.nn.functional.log_softmax(proj, dim=1) # [B, V]
+        attention_layer_1 = self.attention_layer_1(
+            torch.cat([encoder_output, decoder_output.repeat(1, source_length, 1)], dim=2))  # [B, T, H]
+        attention_layer_2 = self.attention_layer_2(torch.tanh(attention_layer_1))  # [B, T, 1]
+        attention_layer_2 = attention_layer_2.masked_fill(attention_mask.unsqueeze(2), LARGE_NEGATIVE)  # [B, T, 1]
+        attention_weights = torch.nn.functional.softmax(attention_layer_2, dim=1).transpose(1, 2)  # [B, 1, T]
+        context = torch.bmm(attention_weights, encoder_output)  # [B, 1, H]
+        gru_output, gru_hidden = self.GRU(torch.cat([embeds, context], dim=2), decoder_hidden)  # [B, S=1, H], [L, B, H]
+        proj = self.linear(torch.cat([gru_output, context, embeds], dim=2).squeeze(1))  # [B, V]
+        log_probs = torch.nn.functional.log_softmax(proj, dim=1)  # [B, V]
         return log_probs, gru_output, gru_hidden
 
 
@@ -428,15 +445,16 @@ class EncoderDecoderGRU(BaseModelClass):
         all_log_probs: Tensor of shape [S, B, V]
         '''
         batch_size, target_length = outputs.shape
-        all_log_probs = torch.zeros(target_length, batch_size, self.output_vocab, device=device) # [S, B, V]
-        decoder_input = outputs[:, 0] # [B]
-        encoder_output, encoder_hidden = self.encoder(inputs) # [B, T, H], [L, B, H]
-        attention_mask = inputs == data_hyperparameters.PAD_TOKEN # [B, T]
-        decoder_output = encoder_output[:, -1, :].unsqueeze(1) # [B, 1, H]
+        all_log_probs = torch.zeros(target_length, batch_size, self.output_vocab, device=device)  # [S, B, V]
+        decoder_input = outputs[:, 0]  # [B]
+        encoder_output, encoder_hidden = self.encoder(inputs)  # [B, T, H], [L, B, H]
+        attention_mask = inputs == data_hyperparameters.PAD_TOKEN  # [B, T]
+        decoder_output = encoder_output[:, -1, :].unsqueeze(1)  # [B, 1, H]
         decoder_hidden = encoder_hidden
         for t in range(1, target_length):
             log_probs, decoder_output, decoder_hidden = self.decoder(decoder_input, attention_mask, encoder_output,
-                                                                     encoder_hidden, decoder_output, decoder_hidden) # [B, V], [B, 1, H], [L, B, H]
+                                                                     encoder_hidden, decoder_output,
+                                                                     decoder_hidden)  # [B, V], [B, 1, H], [L, B, H]
             all_log_probs[t] = log_probs
             decoder_input = outputs[:, t] if teacher_force else torch.argmax(log_probs, dim=1)
         return all_log_probs
@@ -471,19 +489,19 @@ class EncoderLSTM(BaseModelClass):
         encoder_hidden: Tensor of shape [L, B, DH] where D = num_directions
         encoder_cell: Tensor of shape [L, B, DH] where D = num_directions
         '''
-        embeds = self.embedding_dropout(self.embedding(inputs)) # [B, T, E]
+        embeds = self.embedding_dropout(self.embedding(inputs))  # [B, T, E]
         if self.use_packing:
-            input_length = torch.sum(inputs != data_hyperparameters.PAD_TOKEN, dim=-1) # [B]
+            input_length = torch.sum(inputs != data_hyperparameters.PAD_TOKEN, dim=-1)  # [B]
             embeds = torch.nn.utils.rnn.pack_padded_sequence(embeds, input_length, enforce_sorted=False,
                                                              batch_first=True)
-        encoder_output, (encoder_hidden, encoder_cell) = self.LSTM(embeds) # [B, T, DH], [LD, B, H], [LD, B, H]
+        encoder_output, (encoder_hidden, encoder_cell) = self.LSTM(embeds)  # [B, T, DH], [LD, B, H], [LD, B, H]
         if self.use_packing:
             encoder_output, _ = torch.nn.utils.rnn.pad_packed_sequence(encoder_output, batch_first=True)
         if not self.bidirectional:
             return encoder_output, encoder_hidden, encoder_cell
-        encoder_hidden = encoder_hidden.view(self.num_layers, 2, -1, self.hidden_size) # [L, D=2, B, H]
-        encoder_hidden = encoder_hidden.transpose(1, 2) # [L, B, D=2, H]
-        encoder_hidden_forward = encoder_hidden[:, :, 0, :] # [L, B, H]
+        encoder_hidden = encoder_hidden.view(self.num_layers, 2, -1, self.hidden_size)  # [L, D=2, B, H]
+        encoder_hidden = encoder_hidden.transpose(1, 2)  # [L, B, D=2, H]
+        encoder_hidden_forward = encoder_hidden[:, :, 0, :]  # [L, B, H]
         encoder_hidden_backward = encoder_hidden[:, :, 1, :]  # [L, B, H]
         encoder_cell = encoder_cell.view(self.num_layers, 2, -1, self.hidden_size)  # [L, D=2, B, H]
         encoder_cell = encoder_cell.transpose(1, 2)  # [L, B, D=2, H]
@@ -530,10 +548,11 @@ class DecoderLSTM(BaseModelClass):
         lstm_hidden: Tensor of shape [L, B, H]
         lstm_cell: Tensor of shape [L, B, H]
         '''
-        embeds = self.embedding_dropout(self.embedding(inputs.unsqueeze(1))) # [B, 1, E]
-        lstm_output, (lstm_hidden, lstm_cell) = self.LSTM(embeds, (decoder_hidden, decoder_cell)) # [B, S=1, H], [L, B, H], [L, B, H]
-        proj = self.linear(lstm_output.squeeze(1)) # [B, V]
-        log_probs = torch.nn.functional.log_softmax(proj, dim=1) # [B, V]
+        embeds = self.embedding_dropout(self.embedding(inputs.unsqueeze(1)))  # [B, 1, E]
+        lstm_output, (lstm_hidden, lstm_cell) = self.LSTM(embeds, (
+        decoder_hidden, decoder_cell))  # [B, S=1, H], [L, B, H], [L, B, H]
+        proj = self.linear(lstm_output.squeeze(1))  # [B, V]
+        log_probs = torch.nn.functional.log_softmax(proj, dim=1)  # [B, V]
         return log_probs, lstm_output, lstm_hidden, lstm_cell
 
 
@@ -575,11 +594,12 @@ class DecoderLSTMWithContext(BaseModelClass):
         lstm_hidden: Tensor of shape [L, B, H]
         lstm_cell: Tensor of shape [L, B, H]
         '''
-        embeds = self.embedding_dropout(self.embedding(inputs.unsqueeze(1))) # [B, 1, E]
-        context = encoder_hidden[-1, :, :].unsqueeze(1) # [B, 1, H]
-        lstm_output, (lstm_hidden, lstm_cell) = self.LSTM(torch.cat([embeds, context], dim=2), (decoder_hidden, decoder_cell)) # [B, S=1, H], [L, B, H], [L, B, H]
-        proj = self.linear(torch.cat([lstm_output, context, embeds], dim=2).squeeze(1)) # [B, V]
-        log_probs = torch.nn.functional.log_softmax(proj, dim=1) # [B, V]
+        embeds = self.embedding_dropout(self.embedding(inputs.unsqueeze(1)))  # [B, 1, E]
+        context = encoder_hidden[-1, :, :].unsqueeze(1)  # [B, 1, H]
+        lstm_output, (lstm_hidden, lstm_cell) = self.LSTM(torch.cat([embeds, context], dim=2), (
+        decoder_hidden, decoder_cell))  # [B, S=1, H], [L, B, H], [L, B, H]
+        proj = self.linear(torch.cat([lstm_output, context, embeds], dim=2).squeeze(1))  # [B, V]
+        log_probs = torch.nn.functional.log_softmax(proj, dim=1)  # [B, V]
         return log_probs, lstm_output, lstm_hidden, lstm_cell
 
 
@@ -621,14 +641,15 @@ class DecoderLSTMWithDotProductAttention(BaseModelClass):
         lstm_hidden: Tensor of shape [L, B, H]
         lstm_cell: Tensor of shape [L, B, H]
         '''
-        embeds = self.embedding_dropout(self.embedding(inputs.unsqueeze(1))) # [B, 1, E]
-        similarity_scores = torch.bmm(encoder_output, decoder_output.transpose(1, 2)) # [B, T, 1]
-        similarity_scores = similarity_scores.masked_fill(attention_mask.unsqueeze(2), LARGE_NEGATIVE) # [B, T, 1]
-        attention_weights = torch.nn.functional.softmax(similarity_scores, dim=1).transpose(1, 2) # [B, 1, T]
-        context = torch.bmm(attention_weights, encoder_output) # [B, 1, H]
-        lstm_output, (lstm_hidden, lstm_cell) = self.LSTM(torch.cat([embeds, context], dim=2), (decoder_hidden, decoder_cell)) # [B, S=1, H], [L, B, H], [L, B, H]
-        proj = self.linear(torch.cat([lstm_output, context, embeds], dim=2).squeeze(1)) # [B, V]
-        log_probs = torch.nn.functional.log_softmax(proj, dim=1) # [B, V]
+        embeds = self.embedding_dropout(self.embedding(inputs.unsqueeze(1)))  # [B, 1, E]
+        similarity_scores = torch.bmm(encoder_output, decoder_output.transpose(1, 2))  # [B, T, 1]
+        similarity_scores = similarity_scores.masked_fill(attention_mask.unsqueeze(2), LARGE_NEGATIVE)  # [B, T, 1]
+        attention_weights = torch.nn.functional.softmax(similarity_scores, dim=1).transpose(1, 2)  # [B, 1, T]
+        context = torch.bmm(attention_weights, encoder_output)  # [B, 1, H]
+        lstm_output, (lstm_hidden, lstm_cell) = self.LSTM(torch.cat([embeds, context], dim=2), (
+        decoder_hidden, decoder_cell))  # [B, S=1, H], [L, B, H], [L, B, H]
+        proj = self.linear(torch.cat([lstm_output, context, embeds], dim=2).squeeze(1))  # [B, V]
+        log_probs = torch.nn.functional.log_softmax(proj, dim=1)  # [B, V]
         return log_probs, lstm_output, lstm_hidden, lstm_cell
 
 
@@ -672,16 +693,18 @@ class DecoderLSTMWithLearnableAttention(BaseModelClass):
         lstm_hidden: Tensor of shape [L, B, H]
         lstm_cell: Tensor of shape [L, B, H]
         '''
-        embeds = self.embedding_dropout(self.embedding(inputs.unsqueeze(1))) # [B, 1, E]
+        embeds = self.embedding_dropout(self.embedding(inputs.unsqueeze(1)))  # [B, 1, E]
         source_length = encoder_output.shape[1]
-        attention_layer_1 = self.attention_layer_1(torch.cat([encoder_output, decoder_output.repeat(1, source_length, 1)], dim=2)) # [B, T, H]
-        attention_layer_2 = self.attention_layer_2(torch.tanh(attention_layer_1)) # [B, T, 1]
-        attention_layer_2 = attention_layer_2.masked_fill(attention_mask.unsqueeze(2), LARGE_NEGATIVE) # [B, T, 1]
-        attention_weights = torch.nn.functional.softmax(attention_layer_2, dim=1).transpose(1, 2) # [B, 1, T]
-        context = torch.bmm(attention_weights, encoder_output) # [B, 1, H]
-        lstm_output, (lstm_hidden, lstm_cell) = self.LSTM(torch.cat([embeds, context], dim=2), (decoder_hidden, decoder_cell)) # [B, S=1, H], [L, B, H], [L, B, H]
-        proj = self.linear(torch.cat([lstm_output, context, embeds], dim=2).squeeze(1)) # [B, V]
-        log_probs = torch.nn.functional.log_softmax(proj, dim=1) # [B, V]
+        attention_layer_1 = self.attention_layer_1(
+            torch.cat([encoder_output, decoder_output.repeat(1, source_length, 1)], dim=2))  # [B, T, H]
+        attention_layer_2 = self.attention_layer_2(torch.tanh(attention_layer_1))  # [B, T, 1]
+        attention_layer_2 = attention_layer_2.masked_fill(attention_mask.unsqueeze(2), LARGE_NEGATIVE)  # [B, T, 1]
+        attention_weights = torch.nn.functional.softmax(attention_layer_2, dim=1).transpose(1, 2)  # [B, 1, T]
+        context = torch.bmm(attention_weights, encoder_output)  # [B, 1, H]
+        lstm_output, (lstm_hidden, lstm_cell) = self.LSTM(torch.cat([embeds, context], dim=2), (
+        decoder_hidden, decoder_cell))  # [B, S=1, H], [L, B, H], [L, B, H]
+        proj = self.linear(torch.cat([lstm_output, context, embeds], dim=2).squeeze(1))  # [B, V]
+        log_probs = torch.nn.functional.log_softmax(proj, dim=1)  # [B, V]
         return log_probs, lstm_output, lstm_hidden, lstm_cell
 
 
@@ -739,18 +762,19 @@ class EncoderDecoderLSTM(BaseModelClass):
         all_log_probs: Tensor of shape [S, B, V]
         '''
         batch_size, target_length = outputs.shape
-        all_log_probs = torch.zeros(target_length, batch_size, self.output_vocab, device=device) # [S, B, V]
-        decoder_input = outputs[:, 0] # [B]
-        encoder_output, encoder_hidden, encoder_cell = self.encoder(inputs) # [B, T, H], [L, B, H], [L, B, H]
+        all_log_probs = torch.zeros(target_length, batch_size, self.output_vocab, device=device)  # [S, B, V]
+        decoder_input = outputs[:, 0]  # [B]
+        encoder_output, encoder_hidden, encoder_cell = self.encoder(inputs)  # [B, T, H], [L, B, H], [L, B, H]
         attention_mask = inputs == data_hyperparameters.PAD_TOKEN  # [B, T]
-        decoder_output = encoder_output[:, -1, :].unsqueeze(1) # [B, 1, H]
+        decoder_output = encoder_output[:, -1, :].unsqueeze(1)  # [B, 1, H]
         decoder_hidden = encoder_hidden
         decoder_cell = encoder_cell
         for t in range(1, target_length):
             log_probs, decoder_output, decoder_hidden, decoder_cell = self.decoder(decoder_input, attention_mask,
                                                                                    encoder_output, encoder_hidden,
                                                                                    encoder_cell, decoder_output,
-                                                                                   decoder_hidden, decoder_cell) # [B, V], [B, 1, H], [L, B, H], [L, B, H]
+                                                                                   decoder_hidden,
+                                                                                   decoder_cell)  # [B, V], [B, 1, H], [L, B, H], [L, B, H]
             all_log_probs[t] = log_probs
             decoder_input = outputs[:, t] if teacher_force else torch.argmax(log_probs, dim=1)
         return all_log_probs
